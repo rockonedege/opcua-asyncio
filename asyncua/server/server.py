@@ -6,10 +6,13 @@ import asyncio
 import logging
 import math
 from datetime import timedelta, datetime
+import socket
 from urllib.parse import urlparse
-from typing import Coroutine, Optional, Tuple
+from typing import Callable, Optional, Tuple, Union
+from pathlib import Path
 
 from asyncua import ua
+from .address_space import NodeData
 from .binary_server_asyncio import BinaryServer
 from .internal_server import InternalServer
 from .event_generator import EventGenerator
@@ -26,7 +29,8 @@ from ..common.structures104 import load_data_type_definitions
 from ..common.ua_utils import get_nodes_of_namespace
 from ..common.connection import TransportLimits
 
-from ..crypto import security_policies, uacrypto
+from ..crypto import security_policies, uacrypto, validator
+from ..crypto.permission_rules import SimpleRoleRuleset
 
 _logger = logging.getLogger(__name__)
 
@@ -52,11 +56,11 @@ class Server:
     All methods are threadsafe
 
     If you need more flexibility you call directly the Ua Service methods
-    on the iserver  or iserver.isession object members.
+    on the iserver or iserver.isession object members.
 
     During startup the standard address space will be constructed, which may be
     time-consuming when running a server on a less powerful device (e.g. a
-    Raspberry Pi). In order to improve startup performance, a optional path to a
+    Raspberry Pi). In order to improve startup performance, an optional path to a
     cache file can be passed to the server constructor.
     If the parameter is defined, the address space will be loaded from the
     cache file or the file will be created if it does not exist yet.
@@ -88,45 +92,56 @@ class Server:
         self.manufacturer_name = "FreeOpcUa"
         self.application_type = ua.ApplicationType.ClientAndServer
         self.default_timeout: int = 60 * 60 * 1000
-        self.iserver = iserver if iserver else InternalServer(user_manager=user_manager)
+        self.iserver: InternalServer = iserver if iserver else InternalServer(user_manager=user_manager)
         self.bserver: Optional[BinaryServer] = None
         self.socket_address: Optional[Tuple[str, int]] = None
         self._discovery_clients = {}
         self._discovery_period = 60
         self._discovery_handle = None
         self._policies = []
-        self.nodes = Shortcuts(self.iserver.isession)
+        self.nodes: Shortcuts = Shortcuts(self.iserver.isession)
         # enable all endpoints by default
         self._security_policy = [
-            ua.SecurityPolicyType.NoSecurity, ua.SecurityPolicyType.Basic256Sha256_SignAndEncrypt,
-            ua.SecurityPolicyType.Basic256Sha256_Sign, ua.SecurityPolicyType.Aes128Sha256RsaOaep_SignAndEncrypt,
-            ua.SecurityPolicyType.Aes128Sha256RsaOaep_Sign
+            ua.SecurityPolicyType.NoSecurity,
+            ua.SecurityPolicyType.Basic256Sha256_SignAndEncrypt,
+            ua.SecurityPolicyType.Basic256Sha256_Sign,
+            ua.SecurityPolicyType.Aes128Sha256RsaOaep_SignAndEncrypt,
+            ua.SecurityPolicyType.Aes128Sha256RsaOaep_Sign,
+            ua.SecurityPolicyType.Aes256Sha256RsaPss_Sign,
+            ua.SecurityPolicyType.Aes256Sha256RsaPss_SignAndEncrypt,
         ]
         # allow all certificates by default
-        self._permission_ruleset = None
-        self._policyIDs = ["Anonymous", "Basic256Sha256", "Username", "Aes128Sha256RsaOaep"]
-        self.certificate = None
-        # Use accectable limits
+        self._permission_ruleset = SimpleRoleRuleset()
+        # Use acceptable limits
         buffer_sz = 65535
         max_msg_sz = 100 * 1024 * 1024  # 100mb
-        self.limits = TransportLimits(
+        self.limits: TransportLimits = TransportLimits(
             max_recv_buffer=buffer_sz,
             max_send_buffer=buffer_sz,
             max_chunk_count=math.ceil(max_msg_sz / buffer_sz),  # Round up to allow max msg size
-            max_message_size=max_msg_sz
+            max_message_size=max_msg_sz,
         )
 
-    async def init(self, shelf_file=None):
+    async def init(self, shelf_file: Optional[Path] = None):
         await self.iserver.init(shelf_file)
         # setup some expected values
         await self.set_application_uri(self._application_uri)
         sa_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerArray))
         await sa_node.write_value([self._application_uri])
-        #TODO: ServiceLevel is 255 default, should be calculated in later Versions
+        # TODO: ServiceLevel is 255 default, should be calculated in later Versions
         sl_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServiceLevel))
         await sl_node.write_value(ua.Variant(255, ua.VariantType.Byte))
 
         await self.set_build_info(self.product_uri, self.manufacturer_name, self.name, "1.0pre", "0", datetime.now())
+
+    def set_match_discovery_endpoint_url(self, match_discovery_endpoint_url: bool):
+        """
+        Enables or disables the matching of the EndpointUrl request parameter during discovery.
+
+        When True (default), the host/port of endpoints sent during the discovery is modified to the host/port
+        which is specified in the EndpointUrl request parameter.
+        """
+        self.iserver.match_discovery_endpoint_url = match_discovery_endpoint_url
 
     def set_match_discovery_client_ip(self, match_discovery_client_ip: bool):
         """
@@ -139,16 +154,19 @@ class Server:
         """
         self.iserver.match_discovery_source_ip = match_discovery_client_ip
 
-    async def set_build_info(self, product_uri, manufacturer_name, product_name, software_version,
-                             build_number, build_date):
+    def set_force_server_timestamp(self, force_server_timestamp: bool):
+        """
+        Enables or disables automatically setting ServerTimestamp on Value attributes
+        """
+        self.iserver.aspace.force_server_timestamp = force_server_timestamp
 
-        if not all(isinstance(arg, str) for arg in [
-            product_uri,
-            manufacturer_name,
-            product_name,
-            software_version,
-            build_number
-            ]):
+    async def set_build_info(
+        self, product_uri, manufacturer_name, product_name, software_version, build_number, build_date
+    ):
+        if not all(
+            isinstance(arg, str)
+            for arg in [product_uri, manufacturer_name, product_name, software_version, build_number]
+        ):
             raise TypeError(f"""Expected all str got
                 product_uri: {type(product_uri)},
                 manufacturer_name: {type(manufacturer_name)},
@@ -183,9 +201,11 @@ class Server:
         product_uri_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_ProductUri))
         product_name_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_ProductName))
         product_manufacturer_name_node = self.get_node(
-            ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_ManufacturerName))
+            ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_ManufacturerName)
+        )
         product_software_version_node = self.get_node(
-            ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_SoftwareVersion))
+            ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_SoftwareVersion)
+        )
         product_build_number_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_BuildNumber))
         product_build_date_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_BuildInfo_BuildDate))
 
@@ -204,16 +224,17 @@ class Server:
 
     def __str__(self):
         return f"OPC UA Server({self.endpoint.geturl()})"
+
     __repr__ = __str__
 
-    async def load_certificate(self, path: str, format: str = None):
+    async def load_certificate(self, path_or_content: Union[str, bytes, Path], format: str = None):
         """
         load server certificate from file, either pem or der
         """
-        self.certificate = await uacrypto.load_certificate(path, format)
+        self.iserver.certificate = await uacrypto.load_certificate(path_or_content, format)
 
-    async def load_private_key(self, path, password=None, format=None):
-        self.iserver.private_key = await uacrypto.load_private_key(path, password, format)
+    async def load_private_key(self, path_or_content: Union[str, Path, bytes], password=None, format=None):
+        self.iserver.private_key = await uacrypto.load_private_key(path_or_content, password, format)
 
     def disable_clock(self, val: bool = True):
         """
@@ -228,7 +249,7 @@ class Server:
     async def set_application_uri(self, uri: str):
         """
         Set application/server URI.
-        This uri is supposed to be unique. If you intent to register
+        This uri is supposed to be unique. If you intend to register
         your server to a discovery server, it really should be unique in
         your system!
         default is : "urn:freeopcua:python:server"
@@ -253,7 +274,9 @@ class Server:
         params.ServerUris = uris
         return self.iserver.find_servers(params)
 
-    async def register_to_discovery(self, url: str = "opc.tcp://localhost:4840", period: int = 60):
+    async def register_to_discovery(
+        self, url: str = "opc.tcp://localhost:4840", period: int = 60, discovery_configuration=None
+    ):
         """
         Register to an OPC-UA Discovery server. Registering must be renewed at
         least every 10 minutes, so this method will use our asyncio thread to
@@ -262,31 +285,37 @@ class Server:
         """
         # FIXME: have a period per discovery
         if url in self._discovery_clients:
-            await self._discovery_clients[url].disconnect()
+            await self._discovery_clients[url].disconnect_sessionless()
         self._discovery_clients[url] = Client(url)
-        await self._discovery_clients[url].connect()
-        await self._discovery_clients[url].register_server(self)
+        await self._discovery_clients[url].connect_sessionless()
+        await self._discovery_clients[url].register_server(self, discovery_configuration)
+        await self._discovery_clients[url].disconnect_sessionless()
         self._discovery_period = period
         if period:
             asyncio.get_running_loop().call_soon(self._schedule_renew_registration)
 
-    async def unregister_to_discovery(self, url: str = "opc.tcp://localhost:4840"):
+    async def unregister_from_discovery(self, url: str = "opc.tcp://localhost:4840", discovery_configuration=None):
         """
         stop registration thread
         """
-        # FIXME: is there really no way to deregister?
-        await self._discovery_clients[url].disconnect()
+        await self._discovery_clients[url].connect_sessionless()
+        await self._discovery_clients[url].unregister_server(self, discovery_configuration)
+        await self._discovery_clients[url].disconnect_sessionless()
         del self._discovery_clients[url]
         if not self._discovery_clients and self._discovery_handle:
             self._discovery_handle.cancel()
 
     def _schedule_renew_registration(self):
         asyncio.create_task(self._renew_registration())
-        self._discovery_handle = asyncio.get_running_loop().call_later(self._discovery_period, self._schedule_renew_registration)
+        self._discovery_handle = asyncio.get_running_loop().call_later(
+            self._discovery_period, self._schedule_renew_registration
+        )
 
     async def _renew_registration(self):
         for client in self._discovery_clients.values():
-            await client.register_server(self)
+            await client.connect_sessionless()
+            await client.register_server(self)  # FIXME discovery_configuration?
+            await client.disconnect_sessionless()
 
     def allow_remote_admin(self, allow):
         """
@@ -297,7 +326,7 @@ class Server:
     def set_endpoint(self, url):
         self.endpoint = urlparse(url)
 
-    async def get_endpoints(self) -> Coroutine:
+    async def get_endpoints(self):
         return await self.iserver.get_endpoints()
 
     def set_security_policy(self, security_policy, permission_ruleset=None):
@@ -319,91 +348,114 @@ class Server:
 
         """
         self._security_policy = security_policy
-        self._permission_ruleset = permission_ruleset
+        if permission_ruleset is not None:
+            self._permission_ruleset = permission_ruleset
 
     def set_security_IDs(self, policy_ids):
         """
-            Method setting up the security endpoints for identification
-            of clients. During server object initialization, all possible
-            endpoints are enabled:
-
-            self._policyIDs = ["Anonymous", "Basic256Sha256", "Username"]
-
-            E.g. to limit the number of IDs and disable anonymous clients:
-
-                set_security_IDs(["Basic256Sha256"])
-
-        (Implementation for ID check is currently not finalized...)
+        DEPRECATED!
+        Only available for backwards compatibility.
+        Use set_identity_tokens instead.
         """
-        self._policyIDs = policy_ids
+        _logger.warning("set_security_IDs is deprecated, use set_identity_tokens instead!")
+        tokens = []
+        if "Anonymous" in policy_ids:
+            tokens.append(ua.AnonymousIdentityToken)
+        if "Basic256Sha256" in policy_ids:
+            tokens.append(ua.X509IdentityToken)
+        if "Username" in policy_ids:
+            tokens.append(ua.UserNameIdentityToken)
+        self.set_identity_tokens(tokens)
+
+    def set_identity_tokens(self, tokens):
+        """
+        Method setting up allowed identity token types for authentication.
+
+        E.g. to disable anonymous clients:
+
+            set_identity_tokens([ua.X509IdentityToken, ua.UserNameIdentityToken])
+        """
+        self.iserver.supported_tokens = tuple(tokens)
 
     async def _setup_server_nodes(self):
         # to be called just before starting server since it needs all parameters to be setup
-        if ua.SecurityPolicyType.NoSecurity in self._security_policy:
-            self._set_endpoints()
-            self._policies = [ua.SecurityPolicyFactory(permission_ruleset=self._permission_ruleset)]
+        no_cert = False
+        for policy_type in self._security_policy:
+            policy, mode, level = security_policies.SECURITY_POLICY_TYPE_MAP[policy_type]
+            if policy is not security_policies.SecurityPolicyNone and not (
+                self.iserver.certificate and self.iserver.private_key
+            ):
+                no_cert = True
+                continue
+            self._set_endpoints(policy, mode, level)
+            self._policies.append(
+                security_policies.SecurityPolicyFactory(
+                    policy,
+                    mode,
+                    self.iserver.certificate,
+                    self.iserver.private_key,
+                    permission_ruleset=self._permission_ruleset,
+                )
+            )
 
-        if self._security_policy != [ua.SecurityPolicyType.NoSecurity]:
-            if not (self.certificate and self.iserver.private_key):
-                _logger.warning("Endpoints other than open requested but private key and certificate are not set.")
-                return
+        if no_cert:
+            _logger.warning("Endpoints other than open requested but private key and certificate are not set.")
 
-            if ua.SecurityPolicyType.NoSecurity in self._security_policy:
-                _logger.warning(
-                    "Creating an open endpoint to the server, although encrypted endpoints are enabled.")
-
-            if ua.SecurityPolicyType.Basic256Sha256_SignAndEncrypt in self._security_policy:
-                self._set_endpoints(security_policies.SecurityPolicyBasic256Sha256,
-                                    ua.MessageSecurityMode.SignAndEncrypt)
-                self._policies.append(
-                    ua.SecurityPolicyFactory(security_policies.SecurityPolicyBasic256Sha256,
-                                             ua.MessageSecurityMode.SignAndEncrypt, self.certificate,
-                                             self.iserver.private_key,
-                                             permission_ruleset=self._permission_ruleset))
-            if ua.SecurityPolicyType.Basic256Sha256_Sign in self._security_policy:
-                self._set_endpoints(security_policies.SecurityPolicyBasic256Sha256, ua.MessageSecurityMode.Sign)
-                self._policies.append(
-                    ua.SecurityPolicyFactory(security_policies.SecurityPolicyBasic256Sha256,
-                                             ua.MessageSecurityMode.Sign, self.certificate, self.iserver.private_key,
-                                             permission_ruleset=self._permission_ruleset))
-            if ua.SecurityPolicyType.Aes128Sha256RsaOaep_SignAndEncrypt in self._security_policy:
-                self._set_endpoints(security_policies.SecurityPolicyAes128Sha256RsaOaep,
-                                    ua.MessageSecurityMode.SignAndEncrypt)
-                self._policies.append(
-                    ua.SecurityPolicyFactory(security_policies.SecurityPolicyAes128Sha256RsaOaep,
-                                             ua.MessageSecurityMode.SignAndEncrypt, self.certificate,
-                                             self.iserver.private_key,
-                                             permission_ruleset=self._permission_ruleset))
-            if ua.SecurityPolicyType.Aes128Sha256RsaOaep_Sign in self._security_policy:
-                self._set_endpoints(security_policies.SecurityPolicyAes128Sha256RsaOaep, ua.MessageSecurityMode.Sign)
-                self._policies.append(
-                    ua.SecurityPolicyFactory(security_policies.SecurityPolicyAes128Sha256RsaOaep,
-                                             ua.MessageSecurityMode.Sign, self.certificate, self.iserver.private_key,
-                                             permission_ruleset=self._permission_ruleset))
-
-    def _set_endpoints(self, policy=ua.SecurityPolicy, mode=ua.MessageSecurityMode.None_):
+    def _set_endpoints(self, policy, mode, level):
         idtokens = []
-        supported_token_classes = []
-        if "Anonymous" in self._policyIDs:
+        tokens = self.iserver.supported_tokens
+        if ua.AnonymousIdentityToken in tokens:
             idtoken = ua.UserTokenPolicy()
             idtoken.PolicyId = "anonymous"
             idtoken.TokenType = ua.UserTokenType.Anonymous
+            idtoken.SecurityPolicyUri = security_policies.SecurityPolicyNone.URI
             idtokens.append(idtoken)
-            supported_token_classes.append(ua.AnonymousIdentityToken)
 
-        if "Basic256Sha256" in self._policyIDs:
+        if ua.X509IdentityToken in tokens:
             idtoken = ua.UserTokenPolicy()
-            idtoken.PolicyId = 'certificate_basic256sha256'
+            idtoken.PolicyId = "certificate"
             idtoken.TokenType = ua.UserTokenType.Certificate
-            idtokens.append(idtoken)
-            supported_token_classes.append(ua.X509IdentityToken)
+            # always request signing
+            if mode == ua.MessageSecurityMode.None_:
+                # find first policy with signing
+                for token_policy_type in self._security_policy:
+                    token_policy, token_mode, _ = security_policies.SECURITY_POLICY_TYPE_MAP[token_policy_type]
+                    if token_mode == ua.MessageSecurityMode.None_:
+                        continue
+                    idtoken.SecurityPolicyUri = token_policy.URI
+                    idtokens.append(idtoken)
+                    break
+                else:
+                    _logger.warning("No signing policy available, user certificate cannot get verified")
+            else:
+                idtoken.SecurityPolicyUri = policy.URI
+                idtokens.append(idtoken)
 
-        if "Username" in self._policyIDs:
+        if ua.UserNameIdentityToken in tokens:
             idtoken = ua.UserTokenPolicy()
             idtoken.PolicyId = "username"
             idtoken.TokenType = ua.UserTokenType.UserName
+            if mode == ua.MessageSecurityMode.SignAndEncrypt:
+                # channel is encrypted, no need to encrypt password again
+                idtoken.SecurityPolicyUri = security_policies.SecurityPolicyNone.URI
+            elif mode == ua.MessageSecurityMode.Sign:
+                # use same policy for encryption
+                idtoken.SecurityPolicyUri = policy.URI
+            # try to avoid plaintext password, find first policy with encryption
+            elif self.iserver.certificate and self.iserver.private_key:
+                for token_policy_type in self._security_policy:
+                    token_policy, token_mode, _ = security_policies.SECURITY_POLICY_TYPE_MAP[token_policy_type]
+                    if token_mode != ua.MessageSecurityMode.SignAndEncrypt:
+                        continue
+                    idtoken.SecurityPolicyUri = token_policy.URI
+                    break
+                else:
+                    _logger.warning("No encrypting policy available, password may get transferred in plaintext")
+                    idtoken.SecurityPolicyUri = security_policies.SecurityPolicyNone.URI
+            else:
+                _logger.warning("No encrypting policy available, password may get transferred in plaintext")
+                idtoken.SecurityPolicyUri = security_policies.SecurityPolicyNone.URI
             idtokens.append(idtoken)
-            supported_token_classes.append(ua.UserNameIdentityToken)
 
         appdesc = ua.ApplicationDescription()
         appdesc.ApplicationName = ua.LocalizedText(self.name)
@@ -415,15 +467,14 @@ class Server:
         edp = ua.EndpointDescription()
         edp.EndpointUrl = self.endpoint.geturl()
         edp.Server = appdesc
-        if self.certificate:
-            edp.ServerCertificate = uacrypto.der_from_x509(self.certificate)
+        if self.iserver.certificate:
+            edp.ServerCertificate = uacrypto.der_from_x509(self.iserver.certificate)
         edp.SecurityMode = mode
         edp.SecurityPolicyUri = policy.URI
         edp.UserIdentityTokens = idtokens
         edp.TransportProfileUri = "http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary"
-        edp.SecurityLevel = 0
+        edp.SecurityLevel = level
         self.iserver.add_endpoint(edp)
-        self.iserver.supported_tokens = tuple(supported_token_classes)
 
     def set_server_name(self, name):
         self.name = name
@@ -432,6 +483,9 @@ class Server:
         """
         Start to listen on network
         """
+        if self.iserver.certificate is not None:
+            # Log warnings about the certificate
+            uacrypto.check_certificate(self.iserver.certificate, self._application_uri, socket.gethostname())
         await self._setup_server_nodes()
         await self.iserver.start()
         try:
@@ -476,7 +530,7 @@ class Server:
         """
         return self.get_node(ua.TwoByteNodeId(ua.ObjectIds.ObjectsFolder))
 
-    def get_node(self, nodeid):
+    def get_node(self, nodeid: Union[Node, ua.NodeId, str, int]) -> Node:
         """
         Get a specific node using NodeId object or a string representing a NodeId
         """
@@ -535,8 +589,9 @@ class Server:
         await ev_gen.init(etype, emitting_node=emitting_node)
         return ev_gen
 
-    async def create_custom_data_type(self, idx, name, basetype=ua.ObjectIds.BaseDataType,
-                                      properties=None, description=None) -> Coroutine:
+    async def create_custom_data_type(
+        self, idx, name, basetype=ua.ObjectIds.BaseDataType, properties=None, description=None
+    ):
         if properties is None:
             properties = []
         base_t = _get_node(self.iserver.isession, basetype)
@@ -546,23 +601,19 @@ class Server:
             datatype = None
             if len(prop) > 2:
                 datatype = prop[2]
-            await custom_t.add_property(idx, prop[0], ua.get_default_value(prop[1]),
-                                        varianttype=prop[1], datatype=datatype)
+            await custom_t.add_property(
+                idx, prop[0], ua.get_default_value(prop[1]), varianttype=prop[1], datatype=datatype
+            )
         return custom_t
 
-    async def create_custom_event_type(self, idx, name,
-                                       basetype=ua.ObjectIds.BaseEventType, properties=None) -> Coroutine:
+    async def create_custom_event_type(self, idx, name, basetype=ua.ObjectIds.BaseEventType, properties=None):
         if properties is None:
             properties = []
         return await self._create_custom_type(idx, name, basetype, properties, [], [])
 
-    async def create_custom_object_type(self,
-                                        idx,
-                                        name,
-                                        basetype=ua.ObjectIds.BaseObjectType,
-                                        properties=None,
-                                        variables=None,
-                                        methods=None) -> Coroutine:
+    async def create_custom_object_type(
+        self, idx, name, basetype=ua.ObjectIds.BaseObjectType, properties=None, variables=None, methods=None
+    ):
         if properties is None:
             properties = []
         if variables is None:
@@ -574,13 +625,9 @@ class Server:
     # def create_custom_reference_type(self, idx, name, basetype=ua.ObjectIds.BaseReferenceType, properties=[]):
     # return self._create_custom_type(idx, name, basetype, properties)
 
-    async def create_custom_variable_type(self,
-                                          idx,
-                                          name,
-                                          basetype=ua.ObjectIds.BaseVariableType,
-                                          properties=None,
-                                          variables=None,
-                                          methods=None) -> Coroutine:
+    async def create_custom_variable_type(
+        self, idx, name, basetype=ua.ObjectIds.BaseVariableType, properties=None, variables=None, methods=None
+    ):
         if properties is None:
             properties = []
         if variables is None:
@@ -597,22 +644,24 @@ class Server:
             if len(prop) > 2:
                 datatype = prop[2]
             await custom_t.add_property(
-                idx, prop[0], ua.get_default_value(prop[1]), varianttype=prop[1], datatype=datatype)
+                idx, prop[0], ua.get_default_value(prop[1]), varianttype=prop[1], datatype=datatype
+            )
         for variable in variables:
             datatype = None
             if len(variable) > 2:
                 datatype = variable[2]
             await custom_t.add_variable(
-                idx, variable[0], ua.get_default_value(variable[1]), varianttype=variable[1], datatype=datatype)
+                idx, variable[0], ua.get_default_value(variable[1]), varianttype=variable[1], datatype=datatype
+            )
         for method in methods:
             await custom_t.add_method(idx, method[0], method[1], method[2], method[3])
         return custom_t
 
-    async def import_xml(self, path=None, xmlstring=None, strict_mode=True) -> Coroutine:
+    async def import_xml(self, path=None, xmlstring=None, strict_mode=True, auto_load_definitions: bool = True):
         """
         Import nodes defined in xml
         """
-        importer = XmlImporter(self, strict_mode)
+        importer = XmlImporter(self, strict_mode, auto_load_definitions)
         return await importer.import_xml(path, xmlstring)
 
     async def export_xml(self, nodes, path, export_values: bool = False):
@@ -638,7 +687,7 @@ class Server:
         nodes = await get_nodes_of_namespace(self, namespaces)
         await self.export_xml(nodes, path, export_values=export_values)
 
-    async def delete_nodes(self, nodes, recursive=False) -> Coroutine:
+    async def delete_nodes(self, nodes, recursive=False):
         return await delete_nodes(self.iserver.isession, nodes, recursive)
 
     async def historize_node_data_change(self, node, period=timedelta(days=7), count=0):
@@ -696,7 +745,7 @@ class Server:
         """
         self.iserver.isession.add_method_callback(node.nodeid, callback)
 
-    async def load_type_definitions(self, nodes=None) -> Coroutine:
+    async def load_type_definitions(self, nodes=None):
         """
         load custom structures from our server.
         Server side this can be used to create python objects from custom structures
@@ -713,7 +762,7 @@ class Server:
         """
         return await load_data_type_definitions(self, node)
 
-    async def load_enums(self) -> Coroutine:
+    async def load_enums(self):
         """
         load UA structures and generate python Enums in ua module for custom enums in server
         """
@@ -722,13 +771,53 @@ class Server:
 
     async def write_attribute_value(self, nodeid, datavalue, attr=ua.AttributeIds.Value):
         """
-        directly write datavalue to the Attribute, bypasing some checks and structure creation
+        directly write datavalue to the Attribute, bypassing some checks and structure creation,
         so it is a little faster
         """
         return await self.iserver.write_attribute_value(nodeid, datavalue, attr)
+
+    def set_attribute_value_callback(
+        self,
+        nodeid: ua.NodeId,
+        callback: Callable[[ua.NodeId, ua.AttributeIds], ua.DataValue],
+        attr=ua.AttributeIds.Value,
+    ) -> None:
+        """
+        Set a callback function to the Attribute that returns a value for read_attribute_value() instead of the
+        written value. Note that it does not trigger the datachange_callbacks unlike write_attribute_value().
+        """
+        self.iserver.set_attribute_value_callback(nodeid, callback, attr)
+
+    def set_attribute_value_setter(
+        self,
+        nodeid: ua.NodeId,
+        setter: Callable[[NodeData, ua.AttributeIds, ua.DataValue], None],
+        attr=ua.AttributeIds.Value,
+    ) -> None:
+        """
+        Set a setter function for the Attribute. This setter will be called when a new value is set using
+        write_attribute_value() instead of directly writing the value. This is useful, for example, if you want to
+        intercept writes to certain attributes to perform some kind of validation of the value to be written and return
+        appropriate status codes to the client.
+        """
+        self.iserver.set_attribute_value_setter(nodeid, setter, attr)
 
     def read_attribute_value(self, nodeid, attr=ua.AttributeIds.Value):
         """
         directly read datavalue of the Attribute
         """
         return self.iserver.read_attribute_value(nodeid, attr)
+
+    def set_certificate_validator(self, validator: validator.CertificateValidatorMethod):
+        """
+        Assign a method to be called when certificate needs to be validated.
+
+        Function is called with certificate and application description and should raise the correct status code
+        when invalid.
+
+            async def example_validation_method(certificate: x509.Certificate, app_description: ua.ApplicationDescription):
+                ...
+                if not_valid_condition:
+                    raise ServiceError(ua.StatusCodes.BadCertificateInvalid)
+        """
+        self.iserver.certificate_validator = validator

@@ -1,13 +1,13 @@
 import sys
 import asyncio
+
 sys.path.insert(0, "..")
 import logging
 
-from asyncua import Client, ua
+from asyncua import Client
 
 
-class SubHandler(object):
-
+class SubHandler:
     """
     Subscription Handler. To receive events from server for a subscription
     """
@@ -38,6 +38,7 @@ async def main():
         # await sub.unsubscribe(handle1)
         # await sub.unsubscribe(handle2)
         # await sub.delete()
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.WARN)

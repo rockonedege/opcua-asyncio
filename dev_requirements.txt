@@ -1,7 +1,0 @@
-pytest
-pytest-asyncio
-coverage
-pytest-cov
-pytest-mock
-asynctest
-types_aiofiles

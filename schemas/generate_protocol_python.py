@@ -1,11 +1,11 @@
-import os
+from pathlib import Path
 import datetime
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = Path(__file__).absolute().parent.parent
 
 IgnoredEnums = ["NodeIdType"]
 IgnoredStructs = ["QualifiedName", "NodeId", "ExpandedNodeId", "Variant", "DataValue",
-                  "ExtensionObject", "XmlElement", "LocalizedText"]
+                  "ExtensionObject", "XmlElement", "LocalizedText", "RelativePath", "RelativePathElement"]
 MyPyIgnoredStructs = ["Union"]
 
 
@@ -57,10 +57,10 @@ class CodeGenerator:
 
     def make_header(self):
         self.write('"""')
-        self.write(f'Autogenerate code from xml spec\nDate:{datetime.datetime.now()}')
+        self.write(f'Autogenerate code from xml spec\nDate:{datetime.datetime.now(datetime.timezone.utc)}')
         self.write('"""')
         self.write('')
-        self.write('from datetime import datetime')
+        self.write('from datetime import datetime, timezone')
         self.write('from enum import IntEnum, IntFlag')
         self.write('from typing import Union, List, Optional, Type')
         self.write('from dataclasses import dataclass, field')
@@ -70,6 +70,7 @@ class CodeGenerator:
         self.write('from asyncua.ua.uatypes import UInt64, Boolean, Float, Double, Null, String, CharArray, DateTime, Guid')
         self.write('from asyncua.ua.uatypes import AccessLevel, EventNotifier  ')
         self.write('from asyncua.ua.uatypes import LocalizedText, Variant, QualifiedName, StatusCode, DataValue')
+        self.write('from asyncua.ua.uatypes import RelativePath, RelativePathElement')
         self.write('from asyncua.ua.uatypes import NodeId, FourByteNodeId, ExpandedNodeId, ExtensionObject, DiagnosticInfo')
         self.write('from asyncua.ua.uatypes import extension_object_typeids, extension_objects_by_typeid')
         self.write('from asyncua.ua.object_ids import ObjectIds')
@@ -206,7 +207,7 @@ class CodeGenerator:
         if dtype == "Guid":
             return 'Guid(int=0)'
         if dtype == 'DateTime':
-            return 'field(default_factory=datetime.utcnow)'
+            return 'field(default_factory=lambda: datetime.now(timezone.utc))'
         if dtype in ('Int16', 'Int32', 'Int64', 'UInt16', 'UInt32', 'UInt64', 'Double', 'Float', 'Byte'):
             return 0
         if dtype in 'ExtensionObject':
@@ -217,8 +218,8 @@ class CodeGenerator:
 if __name__ == '__main__':
     import generate_model_from_nodeset as gm
 
-    xml_path = os.path.join(BASE_DIR, 'schemas', 'UA-Nodeset-master', 'Schema', 'Opc.Ua.NodeSet2.Services.xml')
-    protocol_path = os.path.join(BASE_DIR, "asyncua", "ua", "uaprotocol_auto.py")
+    xml_path = BASE_DIR.joinpath('schemas', 'UA-Nodeset-master', 'Schema', 'Opc.Ua.NodeSet2.Services.xml')
+    protocol_path = BASE_DIR.joinpath("asyncua", "ua", "uaprotocol_auto.py")
     p = gm.Parser(xml_path)
     model = p.parse()
     gm.nodeid_to_names(model)

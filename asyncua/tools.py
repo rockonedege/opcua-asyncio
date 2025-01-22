@@ -2,9 +2,8 @@ import asyncio
 import logging
 import sys
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import math
-import time
 import concurrent.futures
 
 try:
@@ -64,18 +63,14 @@ def add_common_args(parser, default_node="i=84", require_node=False):
         default="",
         metavar="BROWSEPATH",
     )
-    parser.add_argument(
-        "-i", "--namespace", help="Default namespace", type=int, default=0, metavar="NAMESPACE"
-    )
+    parser.add_argument("-i", "--namespace", help="Default namespace", type=int, default=0, metavar="NAMESPACE")
     parser.add_argument(
         "--security",
         help="Security settings, for example:"
-             " Basic256Sha256,SignAndEncrypt,cert.der,pk.pem[,server_cert.der]. Default: None",
+        " Basic256Sha256,SignAndEncrypt,cert.der,pk.pem[,server_cert.der]. Default: None",
         default="",
     )
-    parser.add_argument(
-        "--user", help="User name for authentication. Overrides the user name given in the URL."
-    )
+    parser.add_argument("--user", help="User name for authentication. Overrides the user name given in the URL.")
     parser.add_argument(
         "--password",
         help="Password name for authentication. Overrides the password given in the URL.",
@@ -95,7 +90,7 @@ def parse_args(parser, requirenodeid=False):
     # logging.basicConfig(format="%(levelname)s: %(message)s", level=getattr(logging, args.loglevel))
     logging.basicConfig(level=getattr(logging, args.loglevel))
     if args.url and "://" not in args.url:
-        logging.info(f"Adding default scheme {ua.OPC_TCP_SCHEME} to URL {args.url}")
+        logging.info("Adding default scheme %s to URL %s", ua.OPC_TCP_SCHEME, args.url)
         args.url = ua.OPC_TCP_SCHEME + "://" + args.url
     if requirenodeid:
         _require_nodeid(parser, args)
@@ -118,9 +113,7 @@ def uaread():
 
 
 async def _uaread():
-    parser = argparse.ArgumentParser(
-        description="Read attribute of a node, per default reads value of a node"
-    )
+    parser = argparse.ArgumentParser(description="Read attribute of a node, per default reads value of a node")
     add_common_args(parser)
     parser.add_argument(
         "-a",
@@ -241,15 +234,11 @@ def _val_to_variant(val, args):
     elif args.datatype == "nodeid":
         return _arg_to_variant(val, array, ua.NodeId.from_string, ua.VariantType.NodeId)
     elif args.datatype == "expandednodeid":
-        return _arg_to_variant(
-            val, array, ua.ExpandedNodeId.from_string, ua.VariantType.ExpandedNodeId
-        )
+        return _arg_to_variant(val, array, ua.ExpandedNodeId.from_string, ua.VariantType.ExpandedNodeId)
     elif args.datatype == "statuscode":
         return _arg_to_variant(val, array, int, ua.VariantType.StatusCode)
     elif args.datatype in ("qualifiedname", "browsename"):
-        return _arg_to_variant(
-            val, array, ua.QualifiedName.from_string, ua.VariantType.QualifiedName
-        )
+        return _arg_to_variant(val, array, ua.QualifiedName.from_string, ua.VariantType.QualifiedName)
     elif args.datatype == "LocalizedText":
         return _arg_to_variant(val, array, ua.LocalizedText, ua.VariantType.LocalizedText)
 
@@ -267,9 +256,7 @@ def uawrite():
 
 
 async def _uawrite():
-    parser = argparse.ArgumentParser(
-        description="Write attribute of a node, per default write value of node"
-    )
+    parser = argparse.ArgumentParser(description="Write attribute of a node, per default write value of node")
     add_common_args(parser)
     parser.add_argument(
         "-a",
@@ -345,9 +332,7 @@ def uals():
 async def _uals():
     parser = argparse.ArgumentParser(description="Browse OPC-UA node and print result")
     add_common_args(parser)
-    parser.add_argument(
-        "-l", dest="long_format", const=3, nargs="?", type=int, help="use a long listing format"
-    )
+    parser.add_argument("-l", dest="long_format", const=3, nargs="?", type=int, help="use a long listing format")
     parser.add_argument("-d", "--depth", default=1, type=int, help="Browse depth")
 
     args = parse_args(parser)
@@ -377,11 +362,7 @@ async def _lsprint_0(node, depth, indent=""):
         print("{0:30} {1:25}".format("DisplayName", "NodeId"))
         print("")
     for desc in await node.get_children_descriptions():
-        print(
-            "{0}{1:30} {2:25}".format(
-                indent, desc.DisplayName.to_string(), desc.NodeId.to_string()
-            )
-        )
+        print("{0}{1:30} {2:25}".format(indent, desc.DisplayName.to_string(), desc.NodeId.to_string()))
         if depth:
             await _lsprint_0(Node(node.session, desc.NodeId), depth - 1, indent + "  ")
 
@@ -455,15 +436,13 @@ async def _lsprint_long(pnode, depth, indent=""):
             )
         else:
             print(
-                "{0}{1:30} {2:25} {3:25}".format(
-                    indent, name.to_string(), bname.to_string(), node.nodeid.to_string()
-                )
+                "{0}{1:30} {2:25} {3:25}".format(indent, name.to_string(), bname.to_string(), node.nodeid.to_string())
             )
         if depth:
             await _lsprint_long(node, depth - 1, indent + "  ")
 
 
-class SubHandler(object):
+class SubHandler:
     def datachange_notification(self, node, val, data):
         print("New data change event", node, val, data)
 
@@ -522,7 +501,7 @@ def application_to_strings(app):
         ("Gateway Server URI", app.GatewayServerUri),
         ("Discovery Profile URI", app.DiscoveryProfileUri),
     ]
-    for (n, v) in optionals:
+    for n, v in optionals:
         if v:
             result.append((n, v))
     if app.DiscoveryUrls:
@@ -534,10 +513,8 @@ def application_to_strings(app):
 def cert_to_string(der):
     if not der:
         return "[no certificate]"
-    try:
-        from .crypto import uacrypto
-    except ImportError:
-        return f"{len(der)} bytes"
+    from .crypto import uacrypto
+
     cert = uacrypto.x509_from_der(der)
     return uacrypto.x509_to_string(cert)
 
@@ -589,7 +566,7 @@ async def _uaclient():
 
     try:
         async with client:
-            mynode = await get_node(client, args)
+            await get_node(client, args)
     except (OSError, concurrent.futures.TimeoutError) as e:
         print(e)
         sys.exit(1)
@@ -602,7 +579,7 @@ async def _uaserver():
         description="Run an example OPC-UA server. By importing xml definition and using uawrite "
         " command line, it is even possible to expose real data using this server"
     )
-    # we setup a server, this is a bit different from other tool so we do not reuse common arguments
+    # we set up a server, this is a bit different from other tool, so we do not reuse common arguments
     parser.add_argument(
         "-u",
         "--url",
@@ -618,9 +595,7 @@ async def _uaserver():
         default="WARNING",
         help="Set log level",
     )
-    parser.add_argument(
-        "-x", "--xml", metavar="XML_FILE", help="Populate address space with nodes defined in XML"
-    )
+    parser.add_argument("-x", "--xml", metavar="XML_FILE", help="Populate address space with nodes defined in XML")
     parser.add_argument(
         "-p",
         "--populate",
@@ -661,6 +636,7 @@ async def _uaserver():
         def multiply(parent, x, y):
             print("multiply method call with parameters: ", x, y)
             return x * y
+
         uri = "http://examples.freeopcua.github.io"
         idx = await server.register_namespace(uri)
         objects = server.nodes.objects
@@ -669,8 +645,8 @@ async def _uaserver():
         await mywritablevar.set_writable()  # Set MyVariable to be writable by clients
         myvar = await myobj.add_variable(idx, "MyVariable", 6.7)
         myarrayvar = await myobj.add_variable(idx, "MyVarArray", [6.7, 7.9])
-        myprop = await myobj.add_property(idx, "MyProperty", "I am a property")
-        mymethod = await myobj.add_method(
+        await myobj.add_property(idx, "MyProperty", "I am a property")
+        await myobj.add_method(
             idx,
             "MyMethod",
             multiply,
@@ -734,9 +710,7 @@ async def _uadiscover():
     try:
         if args.network:
             print(f"Performing discovery at {args.url}\n")
-            for i, server in enumerate(
-                await client.connect_and_find_servers_on_network(), start=1
-            ):
+            for i, server in enumerate(await client.connect_and_find_servers_on_network(), start=1):
                 print(f"Server {i}:")
                 # for (n, v) in application_to_strings(server):
                 # print('  {}: {}'.format(n, v))
@@ -745,13 +719,13 @@ async def _uadiscover():
         print(f"Performing discovery at {args.url}\n")
         for i, server in enumerate(await client.connect_and_find_servers(), start=1):
             print(f"Server {i}:")
-            for (n, v) in application_to_strings(server):
+            for n, v in application_to_strings(server):
                 print(f"  {n}: {v}")
             print("")
 
         for i, ep in enumerate(await client.connect_and_get_server_endpoints(), start=1):
             print(f"Endpoint {i}:")
-            for (n, v) in endpoint_to_strings(ep):
+            for n, v in endpoint_to_strings(ep):
                 print(f"  {n}: {v}")
             print("")
     except (OSError, concurrent.futures.TimeoutError) as e:
@@ -771,7 +745,7 @@ def str_to_datetime(s, default=None):
     if not s:
         if default is not None:
             return default
-        return datetime.utcnow()
+        return datetime.now(timezone.utc)
     # FIXME: try different datetime formats
     for fmt in ["%Y-%m-%d", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"]:
         try:
@@ -803,9 +777,7 @@ async def _uahistoryread():
         action="store_true",
         help="Read event history instead of data change history",
     )
-    parser.add_argument(
-        "-l", "--limit", type=int, default=10, help="Maximum number of notfication to return"
-    )
+    parser.add_argument("-l", "--limit", type=int, default=10, help="Maximum number of notfication to return")
 
     args = parse_args(parser, requirenodeid=True)
 
@@ -814,11 +786,9 @@ async def _uahistoryread():
     await client.connect()
     try:
         node = await get_node(client, args)
-        starttime = str_to_datetime(args.starttime, datetime.utcnow() - timedelta(days=1))
-        endtime = str_to_datetime(args.endtime, datetime.utcnow())
-        print(
-            f"Reading raw history of node {node} at {args.url}; start at {starttime}, end at {endtime}\n"
-        )
+        starttime = str_to_datetime(args.starttime, datetime.now(timezone.utc) - timedelta(days=1))
+        endtime = str_to_datetime(args.endtime, datetime.now(timezone.utc))
+        print(f"Reading raw history of node {node} at {args.url}; start at {starttime}, end at {endtime}\n")
         if args.events:
             evs = await node.read_event_history(starttime, endtime, numvalues=args.limit)
             for ev in evs:
@@ -936,7 +906,7 @@ def uageneratestructs():
 async def _uageneratestructs():
     parser = argparse.ArgumentParser(
         description="Generate a Python module from the xml structure definition (.bsd),"
-                    " the node argument is typically a children of i=93"
+        " the node argument is typically a children of i=93"
     )
     add_common_args(parser, require_node=True)
     parser.add_argument(

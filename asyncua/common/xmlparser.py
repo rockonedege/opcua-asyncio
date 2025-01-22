@@ -1,6 +1,7 @@
 """
 parse xml file from asyncua-spec
 """
+
 import re
 import asyncio
 import base64
@@ -34,7 +35,6 @@ def _to_bool(val):
 
 
 class NodeData:
-
     def __init__(self):
         self.nodetype = None
         self.nodeid = None
@@ -89,7 +89,6 @@ class Field:
 
 
 class RefStruct:
-
     def __init__(self):
         self.reftype = None
         self.forward = True
@@ -102,7 +101,6 @@ class RefStruct:
 
 
 class ExtObj:
-
     def __init__(self):
         self.typeid = None
         self.objname = None
@@ -116,16 +114,15 @@ class ExtObj:
 
 
 class XMLParser:
-
     def __init__(self):
         self.logger = logging.getLogger(__name__)
         self._retag = re.compile(r"(\{.*\})(.*)")
         self.root = None
         self.ns = {
-            'base': "http://opcfoundation.org/UA/2011/03/UANodeSet.xsd",
-            'uax': "http://opcfoundation.org/UA/2008/02/Types.xsd",
-            'xsd': "http://www.w3.org/2001/XMLSchema",
-            'xsi': "http://www.w3.org/2001/XMLSchema-instance"
+            "base": "http://opcfoundation.org/UA/2011/03/UANodeSet.xsd",
+            "uax": "http://opcfoundation.org/UA/2008/02/Types.xsd",
+            "xsd": "http://www.w3.org/2001/XMLSchema",
+            "xsi": "http://www.w3.org/2001/XMLSchema-instance",
         }
 
     async def parse(self, xmlpath=None, xmlstring=None):
@@ -149,7 +146,7 @@ class XMLParser:
         namespaces_uris = []
         for child in self.root:
             tag = self._retag.match(child.tag).groups()[1]
-            if tag == 'NamespaceUris':
+            if tag == "NamespaceUris":
                 namespaces_uris = [ns_element.text for ns_element in child]
                 break
         return namespaces_uris
@@ -161,7 +158,7 @@ class XMLParser:
         aliases = {}
         for child in self.root:
             tag = self._retag.match(child.tag).groups()[1]
-            if tag == 'Aliases':
+            if tag == "Aliases":
                 for el in child:
                     aliases[el.attrib["Alias"]] = el.text
                 break
@@ -219,6 +216,8 @@ class XMLParser:
             obj.useraccesslevel = int(val)
         elif key == "Symmetric":
             obj.symmetric = _to_bool(val)
+        elif key == "Historizing":
+            obj.historizing = _to_bool(val)
         else:
             self.logger.info("Attribute not implemented: %s:%s", key, val)
 
@@ -243,6 +242,9 @@ class XMLParser:
             for field in el:
                 field = self._parse_field(field)
                 obj.definitions.append(field)
+        elif tag == "Documentation" or tag == "Category":
+            # Only for documentation
+            pass
         else:
             self.logger.info("Not implemented tag: %s", el)
 
@@ -352,8 +354,8 @@ class XMLParser:
 
     def _parse_list_of_extension_object(self, el):
         """
-        Parse a uax:ListOfExtensionObject Value
-        Return an list of ExtObj
+        Parse an uax:ListOfExtensionObject Value
+        Return a list of ExtObj
         """
         value = []
         for extension_object in el:
@@ -365,11 +367,11 @@ class XMLParser:
         ext = ExtObj()
         for extension_object_part in el:
             ntag = self._retag.match(extension_object_part.tag).groups()[1]
-            if ntag == 'TypeId':
-                ntag = self._retag.match(extension_object_part.find('*').tag).groups()[1]
+            if ntag == "TypeId":
+                ntag = self._retag.match(extension_object_part.find("*").tag).groups()[1]
                 ext.typeid = self._get_text(extension_object_part)
-            elif ntag == 'Body':
-                ext.objname = self._retag.match(extension_object_part.find('*').tag).groups()[1]
+            elif ntag == "Body":
+                ext.objname = self._retag.match(extension_object_part.find("*").tag).groups()[1]
                 ext.body = self._parse_body(extension_object_part)
             else:
                 self.logger.warning("Unknown ntag", ntag)
@@ -398,7 +400,6 @@ class XMLParser:
         if nsval is not None:
             ns = string_to_val(nsval.text, ua.VariantType.UInt16)
         v = ua.QualifiedName(name, ns)
-        self.logger.warning("qn: %s", v)
         return v
 
     def _parse_refs(self, el, obj):
@@ -448,14 +449,16 @@ class XMLParser:
         Get all namespaces that are registered with version and date_time
         """
         ns = []
-        for model in self.root.findall('base:Models/base:Model', self.ns):
-            uri = model.attrib.get('ModelUri')
+        for model in self.root.findall("base:Models/base:Model", self.ns):
+            uri = model.attrib.get("ModelUri")
             if uri is not None:
-                version = model.attrib.get('Version', '')
-                date_time = model.attrib.get('PublicationDate')
+                version = model.attrib.get("Version", "")
+                date_time = model.attrib.get("PublicationDate")
                 if date_time is None:
                     date_time = ua.DateTime(1, 1, 1)
-                else:
+                elif date_time is not None and date_time[-1] == "Z":
                     date_time = ua.DateTime.strptime(date_time, "%Y-%m-%dT%H:%M:%SZ")
+                else:
+                    date_time = ua.DateTime.strptime(date_time, "%Y-%m-%dT%H:%M:%S%z")
                 ns.append((uri, version, date_time))
         return ns

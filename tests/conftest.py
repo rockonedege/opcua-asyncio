@@ -1,7 +1,7 @@
 import asyncio
 import pytest
 import operator
-import os
+from pathlib import Path
 import socket
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Process, Condition, Event
@@ -19,14 +19,11 @@ from asyncua.server.history_sql import HistorySQLite
 from .test_common import add_server_methods
 from .util_enum_struct import add_server_custom_enum_struct
 
-
-
-
-
 RETRY = 20
 SLEEP = 0.4
 PORTS_USED = set()
-Opc = namedtuple('opc', ['opc', 'server'])
+Opc = namedtuple("Opc", ["opc", "server"])
+
 
 def find_free_port():
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
@@ -39,25 +36,26 @@ def find_free_port():
         else:
             return find_free_port()
 
+
 port_num = find_free_port()
 port_num1 = find_free_port()
 port_discovery = find_free_port()
 
 
 def pytest_generate_tests(metafunc):
-    mark = metafunc.definition.get_closest_marker('parametrize')
+    mark = metafunc.definition.get_closest_marker("parametrize")
     # override the opc parameters when explicilty provided
     if getattr(mark, "args", None) and "opc" in mark.args:
         pass
     elif "opc" in metafunc.fixturenames:
-        metafunc.parametrize('opc', ['client', 'server'], indirect=True)
-    elif 'history' in metafunc.fixturenames:
-        metafunc.parametrize('history', ['dict', 'sqlite'], indirect=True)
-    elif 'history_server' in metafunc.fixturenames:
-        metafunc.parametrize('history_server', ['dict', 'sqlite'], indirect=True)
+        metafunc.parametrize("opc", ["client", "server"], indirect=True)
+    elif "history" in metafunc.fixturenames:
+        metafunc.parametrize("history", ["dict", "sqlite"], indirect=True)
+    elif "history_server" in metafunc.fixturenames:
+        metafunc.parametrize("history_server", ["dict", "sqlite"], indirect=True)
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture(scope="module")
 def event_loop(request):
     """Create an instance of the default event loop for each test case."""
     loop = get_event_loop_policy().new_event_loop()
@@ -91,7 +89,7 @@ class ServerProcess(Process):
 
     async def wait_for_start(self):
         with ThreadPoolExecutor() as pool:
-            result = await asyncio.get_running_loop().run_in_executor(pool, self.wait_for_start_sync)
+            await asyncio.get_running_loop().run_in_executor(pool, self.wait_for_start_sync)
 
     def wait_for_start_sync(self):
         with self.cond:
@@ -102,7 +100,7 @@ class ServerProcess(Process):
         loop.run_until_complete(self.run_server(self.url))
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture(scope="module")
 async def running_server(request):
     """
     Spawn a server in a separate process
@@ -116,12 +114,12 @@ async def running_server(request):
     process.join()
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture(scope="module")
 async def server():
     # start our own server
     srv = Server()
     await srv.init()
-    srv.set_endpoint(f'opc.tcp://127.0.0.1:{port_num}')
+    srv.set_endpoint(f"opc.tcp://127.0.0.1:{port_num}")
     await add_server_methods(srv)
     await add_server_custom_enum_struct(srv)
     await srv.start()
@@ -130,63 +128,63 @@ async def server():
     await srv.stop()
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture(scope="module")
 async def discovery_server():
     # start our own server
     srv = Server()
     await srv.init()
-    await srv.set_application_uri('urn:freeopcua:python:discovery')
-    srv.set_endpoint(f'opc.tcp://127.0.0.1:{port_discovery}')
+    await srv.set_application_uri("urn:freeopcua:python:discovery")
+    srv.set_endpoint(f"opc.tcp://127.0.0.1:{port_discovery}")
     await srv.start()
     yield srv
     # stop the server
     await srv.stop()
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture(scope="module")
 async def admin_client():
     # start admin client
     # long timeout since travis (automated testing) can be really slow
-    clt = Client(f'opc.tcp://admin@127.0.0.1:{port_num}', timeout=10)
+    clt = Client(f"opc.tcp://admin@127.0.0.1:{port_num}", timeout=10)
     await clt.connect()
     yield clt
     await clt.disconnect()
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture(scope="module")
 async def client():
     # start anonymous client
-    ro_clt = Client(f'opc.tcp://127.0.0.1:{port_num}')
+    ro_clt = Client(f"opc.tcp://127.0.0.1:{port_num}")
     await ro_clt.connect()
     yield ro_clt
     await ro_clt.disconnect()
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture(scope="module")
 async def opc(request):
     """
     Fixture for tests that should run for both `Server` and `Client`
     :param request:
     :return:
     """
-    if request.param == 'client':
+    if request.param == "client":
         srv = Server()
         await srv.init()
-        srv.set_endpoint(f'opc.tcp://127.0.0.1:{port_num}')
+        srv.set_endpoint(f"opc.tcp://127.0.0.1:{port_num}")
         await add_server_methods(srv)
         await srv.start()
         # start client
         # long timeout since travis (automated testing) can be really slow
-        clt = Client(f'opc.tcp://admin@127.0.0.1:{port_num}', timeout=10)
+        clt = Client(f"opc.tcp://admin@127.0.0.1:{port_num}", timeout=10)
         await clt.connect()
         yield Opc(clt, srv)
         await clt.disconnect()
         await srv.stop()
-    elif request.param == 'server':
+    elif request.param == "server":
         # start our own server
         srv = Server()
         await srv.init()
-        srv.set_endpoint(f'opc.tcp://127.0.0.1:{port_num1}')
+        srv.set_endpoint(f"opc.tcp://127.0.0.1:{port_num1}")
         await add_server_methods(srv)
         await srv.start()
         yield Opc(srv, srv)
@@ -198,13 +196,13 @@ async def opc(request):
 
 @pytest.fixture()
 async def history(request):
-    if request.param == 'dict':
+    if request.param == "dict":
         h = HistoryDict()
         await h.init()
         yield h
         await h.stop()
-    elif request.param == 'sqlite':
-        h = HistorySQLite(':memory:')
+    elif request.param == "sqlite":
+        h = HistorySQLite(":memory:")
         await h.init()
         yield h
         await h.stop()
@@ -227,7 +225,7 @@ async def create_srv_events(history_server: HistoryServer):
     for i in history_server.ev_values:
         srv_evgen.event.Severity = history_server.ev_values[i]
         await srv_evgen.trigger(message="test message")
-        await asyncio.sleep(.1)
+        await asyncio.sleep(0.1)
     await asyncio.sleep(2)
 
 
@@ -244,7 +242,7 @@ async def create_var(history_server: HistoryServer):
 async def create_history_server(sqlite=False) -> HistoryServer:
     history_server = HistoryServer()
     await history_server.srv.init()
-    history_server.srv.set_endpoint(f'opc.tcp://127.0.0.1:{port_num if not sqlite else port_num1}')
+    history_server.srv.set_endpoint(f"opc.tcp://127.0.0.1:{port_num if not sqlite else port_num1}")
     await history_server.srv.start()
     if sqlite:
         history = HistorySQLite(":memory:")
@@ -255,32 +253,33 @@ async def create_history_server(sqlite=False) -> HistoryServer:
     return history_server
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture(scope="module")
 async def history_server(request):
-    if request.param == 'dict':
+    if request.param == "dict":
         srv = await create_history_server()
         yield srv
         await srv.srv.stop()
-    elif request.param == 'sqlite':
+    elif request.param == "sqlite":
         srv = await create_history_server(sqlite=True)
         yield srv
         await srv.srv.stop()
 
+
 @pytest.fixture(scope="session")
 def client_key_and_cert(request):
-    base_dir = os.path.dirname(os.path.dirname(__file__))
-    cert_dir = os.path.join(base_dir, "examples/certificates") + os.sep
-    key = f"{cert_dir}peer-private-key-example-1.pem"
-    cert = f"{cert_dir}peer-certificate-example-1.der"
+    base_dir = Path(__file__).parent.parent
+    cert_dir = base_dir / "examples/certificates"
+    key = cert_dir / "peer-private-key-example-1.pem"
+    cert = cert_dir / "peer-certificate-example-1.der"
     return key, cert
 
 
 @pytest.fixture(scope="session")
 def server_key_and_cert(request):
-    base_dir = os.path.dirname(os.path.dirname(__file__))
-    cert_dir = os.path.join(base_dir, "examples") + os.sep
-    key = f"{cert_dir}private-key-example.pem"
-    cert = f"{cert_dir}certificate-example.der"
+    base_dir = Path(__file__).parent.parent
+    cert_dir = base_dir / "examples"
+    key = cert_dir / "private-key-example.pem"
+    cert = cert_dir / "certificate-example.der"
     return key, cert
 
 
@@ -401,7 +400,9 @@ async def wait_clients_socket(ha_client, state):
                 else:
                     break
             await sleep(SLEEP)
-        assert (not client.uaclient.protocol and state == UASocketProtocol.CLOSED) or client.uaclient.protocol.state == state
+        assert (
+            not client.uaclient.protocol and state == UASocketProtocol.CLOSED
+        ) or client.uaclient.protocol.state == state
 
 
 async def wait_sub_in_real_map(ha_client, sub, negation=False):
@@ -410,9 +411,7 @@ async def wait_sub_in_real_map(ha_client, sub, negation=False):
     for client in ha_client.get_clients():
         url = client.server_url.geturl()
         for _ in range(RETRY):
-            if oper(
-                reconciliator.real_map.get(url) and reconciliator.real_map[url].get(sub)
-            ):
+            if oper(reconciliator.real_map.get(url) and reconciliator.real_map[url].get(sub)):
                 break
             await sleep(SLEEP)
         assert oper(reconciliator.real_map[url].get(sub))
