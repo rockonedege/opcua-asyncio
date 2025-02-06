@@ -1,5 +1,5 @@
 """
-server side implementation of callback event 
+server side implementation of callback event
 """
 
 from collections import OrderedDict
@@ -15,6 +15,7 @@ class CallbackType(Enum):
     :ivar MonitoredItem:
 
     """
+
     Null = 0
     ItemSubscriptionCreated = 1
     ItemSubscriptionModified = 2
@@ -25,7 +26,7 @@ class CallbackType(Enum):
     PostRead = 7
 
 
-class Callback(object):
+class Callback:
     def __init__(self):
         self.__name = None
 
@@ -44,12 +45,12 @@ class ServerItemCallback(Callback):
         self.user = user
 
 
-class CallbackSubscriberInterface(object):
+class CallbackSubscriberInterface:
     def getSubscribedEvents(self):
         raise NotImplementedError()
 
 
-class CallbackService(object):
+class CallbackService:
     def __init__(self):
         self._listeners = {}
 
@@ -57,7 +58,7 @@ class CallbackService(object):
         if event is None:
             event = Callback()
         elif not isinstance(event, Callback):
-            raise ValueError('Unexpected event type given')
+            raise ValueError("Unexpected event type given")
         event.setName(eventName)
         if eventName not in self._listeners:
             return event
@@ -84,14 +85,14 @@ class CallbackService(object):
         if not listener:
             del self._listeners[eventName]
         else:
-            for p, l in self._listeners[eventName].items():
-                if l is listener:
-                    self._listeners[eventName].pop(p)
+            for name, mylistener in self._listeners[eventName].items():
+                if mylistener is listener:
+                    self._listeners[eventName].pop(name)
                     return
 
     def addSubscriber(self, subscriber):
         if not isinstance(subscriber, CallbackSubscriberInterface):
-            raise ValueError('Unexpected subscriber type given')
+            raise ValueError("Unexpected subscriber type given")
         for eventName, params in subscriber.getSubscribedEvents().items():
             if isinstance(params, str):
                 self.addListener(eventName, getattr(subscriber, params))

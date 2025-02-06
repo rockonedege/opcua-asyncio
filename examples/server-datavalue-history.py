@@ -1,22 +1,21 @@
 import asyncio
 import sys
+
 sys.path.insert(0, "..")
 import math
-
 
 from asyncua import ua, Server
 from asyncua.server.history_sql import HistorySQLite
 
 
 async def main():
-
     # setup our server
     server = Server()
-    
+
     # Configure server to use sqlite as history database (default is a simple memory dict)
     server.iserver.history_manager.set_storage(HistorySQLite("my_datavalue_history.sql"))
-    
-    # initialize server 
+
+    # initialize server
     await server.init()
 
     server.set_endpoint("opc.tcp://0.0.0.0:4840/freeopcua/server/")
@@ -50,6 +49,7 @@ async def main():
     finally:
         # close connection, remove subscriptions, etc
         await server.stop()
+
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()

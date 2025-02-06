@@ -3,13 +3,17 @@ import asyncio
 import pytest
 from copy import copy
 from asyncio import Future, sleep, wait_for, TimeoutError
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from asyncua.common.subscription import Subscription
+
 try:
     from unittest.mock import AsyncMock
 except ImportError:
-    from asynctest import CoroutineMock as AsyncMock
+    from asynctest import CoroutineMock as AsyncMock  # type: ignore[no-redef]
 import asyncua
 from asyncua import ua, Client
+
+from .conftest import Opc
 
 
 class MySubHandler:
@@ -99,7 +103,7 @@ async def test_subscription_overload(opc, handler_class):
     variables = []
     subs = []
     for i in range(nb):
-        v = await o.add_variable(3, f'SubscriptionVariableOverload{i}', 99)
+        v = await o.add_variable(3, f"SubscriptionVariableOverload{i}", 99)
         variables.append(v)
     for i in range(nb):
         await sub.subscribe_data_change(variables)
@@ -127,7 +131,7 @@ async def test_subscription_count(opc, handler_class):
     myhandler = handler_class()
     sub = await opc.opc.create_subscription(1, myhandler)
     o = opc.opc.nodes.objects
-    var = await o.add_variable(3, 'SubVarCounter', 0.1)
+    var = await o.add_variable(3, "SubVarCounter", 0.1)
     await sub.subscribe_data_change(var)
     nb = 100
     for i in range(nb):
@@ -144,7 +148,7 @@ async def test_subscription_count_list(opc, handler_class):
     myhandler = handler_class()
     sub = await opc.opc.create_subscription(1, myhandler)
     o = opc.opc.nodes.objects
-    var = await o.add_variable(3, 'SubVarCounter1', [0.1, 0.2])
+    var = await o.add_variable(3, "SubVarCounter1", [0.1, 0.2])
     await sub.subscribe_data_change(var)
     nb = 12
     for i in range(nb):
@@ -164,7 +168,7 @@ async def test_subscription_count_no_change(opc, handler_class):
     myhandler = handler_class()
     sub = await opc.opc.create_subscription(1, myhandler)
     o = opc.opc.nodes.objects
-    var = await o.add_variable(3, 'SubVarCounter2', [0.1, 0.2])
+    var = await o.add_variable(3, "SubVarCounter2", [0.1, 0.2])
     await sub.subscribe_data_change(var)
     nb = 12
     for i in range(nb):
@@ -181,7 +185,7 @@ async def test_subscription_count_empty(opc, handler_class):
     myhandler = handler_class()
     sub = await opc.opc.create_subscription(1, myhandler)
     o = opc.opc.nodes.objects
-    var = await o.add_variable(3, 'SubVarCounter3', [0.1, 0.2, 0.3])
+    var = await o.add_variable(3, "SubVarCounter3", [0.1, 0.2, 0.3])
     await sub.subscribe_data_change(var)
     while True:
         val = await var.read_value()
@@ -204,7 +208,7 @@ async def test_subscription_overload_simple(opc):
     sub = await opc.opc.create_subscription(1, myhandler)
     variables = []
     for i in range(nb):
-        variables.append(await o.add_variable(3, f'SubVarOverload{i}', i))
+        variables.append(await o.add_variable(3, f"SubVarOverload{i}", i))
     for i in range(nb):
         await sub.subscribe_data_change(variables)
     await sub.delete()
@@ -221,7 +225,7 @@ async def test_subscription_data_change(opc):
     o = opc.opc.nodes.objects
     # subscribe to a variable
     startv1 = [1, 2, 3]
-    v1 = await o.add_variable(3, 'SubscriptionVariableV1', startv1)
+    v1 = await o.add_variable(3, "SubscriptionVariableV1", startv1)
     sub = await opc.opc.create_subscription(100, myhandler)
     handle1 = await sub.subscribe_data_change(v1)
     # Now check we get the start value
@@ -245,6 +249,55 @@ async def test_subscription_data_change(opc):
     await opc.opc.delete_nodes([v1])
 
 
+async def test_subscription_monitored_item(opc: Opc):
+    """
+    test subscriptions with a monitored item with a datachange filter.
+
+    filter is Trigger=ua.DataChangeTrigger.StatusValueTimestamp (Part 4 7.17.2 DataChangeFilter)
+    """
+    myhandler = MySubHandler()
+    o = opc.opc.nodes.objects
+    # subscribe to a variable, adding the variable will also set a sourcetimestamp on the value
+    startv1 = [1, 2, 3]
+    v1 = await o.add_variable(3, "SubscriptionVariableV1", startv1)
+    sub: Subscription = await opc.opc.create_subscription(100, myhandler)
+
+    mfilter = ua.DataChangeFilter(Trigger=ua.DataChangeTrigger.StatusValueTimestamp)
+
+    # For creating monitor items create_monitored_items is availablem, but that one is not very easy in use.
+    # So use the internal function instead.
+    # TODO: Should there be an easy shorthand for making monitored items with filter?
+    handles = await sub._subscribe(nodes=v1, mfilter=mfilter)
+
+    # # Now check we get the start value
+    node, val, data = await myhandler.result()
+    assert startv1 == val
+    assert v1 == node
+    myhandler.reset()  # reset future object
+
+    # modify v1 and check we get value
+    # Instead of  v1.write_value([5]) use the datavalue to prevent setting a source stamp
+    await v1.write_value(ua.DataValue([5]))
+
+    # first change will trigger an event (now the new sourcetimestamp becomes not set)
+    node, val, data = await myhandler.result()
+    assert v1 == node
+    assert [5] == val
+    myhandler.reset()  # reset future object
+
+    # second update; again use the datavalue to prevent setting a source stamp
+    await v1.write_value(ua.DataValue([6]))
+
+    # seccond change will trigger based on value (no change in sourcetimestamp)
+    node, val, data = await myhandler.result()
+    assert v1 == node
+    assert [6] == val
+
+    await sub.unsubscribe(handles)  # typing issues
+    await sub.delete()
+    await opc.opc.delete_nodes([v1])
+
+
 @pytest.mark.parametrize("opc", ["client"], indirect=True)
 async def test_create_subscription_publishing(opc):
     """
@@ -252,7 +305,7 @@ async def test_create_subscription_publishing(opc):
     """
     myhandler = MySubHandler()
     o = opc.opc.nodes.objects
-    _ = await o.add_variable(3, 'SubscriptionVariable', 123)
+    _ = await o.add_variable(3, "SubscriptionVariable", 123)
     # publishing default to True
     sub = await opc.opc.create_subscription(100, myhandler)
     assert sub.parameters.PublishingEnabled
@@ -270,7 +323,7 @@ async def test_set_monitoring_mode(opc, mocker):
     monitoring_mode = ua.SetMonitoringModeParameters()
     _ = mocker.patch.object(ua, "SetMonitoringModeParameters", return_value=monitoring_mode)
     _ = mocker.patch("asyncua.client.ua_client.UaClient.set_monitoring_mode", new=AsyncMock())
-    _ = await o.add_variable(3, 'SubscriptionVariable2', 123)
+    _ = await o.add_variable(3, "SubscriptionVariable2", 123)
     sub = await opc.opc.create_subscription(100, myhandler)
 
     await sub.set_monitoring_mode(ua.MonitoringMode.Disabled)
@@ -290,7 +343,7 @@ async def test_set_publishing_mode(opc, mocker):
     publishing_mode = ua.SetPublishingModeParameters()
     _ = mocker.patch.object(ua, "SetPublishingModeParameters", return_value=publishing_mode)
     _ = mocker.patch("asyncua.client.ua_client.UaClient.set_publishing_mode", new=AsyncMock())
-    _ = await o.add_variable(3, 'SubscriptionVariable3', 123)
+    _ = await o.add_variable(3, "SubscriptionVariable3", 123)
     sub = await opc.opc.create_subscription(100, myhandler)
 
     await sub.set_publishing_mode(False)
@@ -311,7 +364,7 @@ async def test_subscription_data_change_bool(opc):
     o = opc.opc.nodes.objects
     # subscribe to a variable
     startv1 = True
-    v1 = await o.add_variable(3, 'SubscriptionVariableBool', startv1)
+    v1 = await o.add_variable(3, "SubscriptionVariableBool", startv1)
     sub = await opc.opc.create_subscription(100, myhandler)
     _ = await sub.subscribe_data_change(v1)
     # Now check we get the start value
@@ -328,6 +381,37 @@ async def test_subscription_data_change_bool(opc):
     await opc.opc.delete_nodes([v1])
 
 
+async def test_subscription_data_change_complex(opc):
+    """
+    test subscriptions. This is far too complicated for
+    a unittest but, setting up subscriptions requires a lot
+    of code, so when we first set it up, it is best
+    to test as many things as possible.
+    Check if a mutable object is handeled corretly
+    """
+    myhandler = MySubHandler()
+    o = opc.opc.nodes.objects
+    # subscribe to a variable
+    startv1 = ua.BuildInfo("ABC")
+    v1 = await o.add_variable(3, "SubscriptionVariableLoc", startv1)
+    sub = await opc.opc.create_subscription(100, myhandler)
+    _ = await sub.subscribe_data_change(v1)
+    # Now check we get the start value
+    node, val, data = await myhandler.result()
+    assert startv1 == val
+    assert v1 == node
+    myhandler.reset()  # reset future object
+    # modify v1 and check we get value
+    startv1.ProductUri = "BB"
+    await v1.write_value(startv1)
+    node, val, data = await myhandler.result()
+    assert v1 == node
+    assert startv1 == val
+    assert val.ProductUri == "BB"
+    await sub.delete()  # should delete our monitoreditem too
+    await opc.opc.delete_nodes([v1])
+
+
 async def test_subscription_data_change_many(opc):
     """
     test subscriptions. This is far too complicated for
@@ -338,9 +422,9 @@ async def test_subscription_data_change_many(opc):
     myhandler = MySubHandler2()
     o = opc.opc.nodes.objects
     startv1 = True
-    v1 = await o.add_variable(3, 'SubscriptionVariableMany1', startv1)
+    v1 = await o.add_variable(3, "SubscriptionVariableMany1", startv1)
     startv2 = [1.22, 1.65]
-    v2 = await o.add_variable(3, 'SubscriptionVariableMany2', startv2)
+    v2 = await o.add_variable(3, "SubscriptionVariableMany2", startv2)
     sub = await opc.opc.create_subscription(100, myhandler)
     handle1, handle2 = await sub.subscribe_data_change([v1, v2])
     # Now check we get the start values
@@ -395,10 +479,10 @@ async def test_subscribe_server_time(opc):
     server_time_node = opc.opc.get_node(ua.NodeId(ua.ObjectIds.Server_ServerStatus_CurrentTime))
     sub = await opc.opc.create_subscription(200, myhandler)
     handle = await sub.subscribe_data_change(server_time_node)
-    assert type(handle) is int
+    assert isinstance(handle, int)
     node, val, data = await myhandler.result()
     assert server_time_node == node
-    delta = datetime.utcnow() - val
+    delta = datetime.now(timezone.utc) - val
     assert delta < timedelta(seconds=2)
     await sub.unsubscribe(handle)
     await sub.delete()
@@ -417,7 +501,7 @@ async def test_modify_monitored_item(opc):
     results = await sub.modify_monitored_item(handle, 2000)
     assert results
     assert len(results) == 1
-    assert type(results[0]) == ua.MonitoredItemModifyResult
+    assert type(results[0]) is ua.MonitoredItemModifyResult
     assert results[0].RevisedSamplingInterval == 2000
     await sub.unsubscribe(handle)
     await sub.delete()
@@ -425,7 +509,7 @@ async def test_modify_monitored_item(opc):
 
 async def test_create_delete_subscription(opc):
     o = opc.opc.nodes.objects
-    v = await o.add_variable(3, 'SubscriptionVariable4', [1, 2, 3])
+    v = await o.add_variable(3, "SubscriptionVariable4", [1, 2, 3])
     sub = await opc.opc.create_subscription(100, MySubHandler())
     handle = await sub.subscribe_data_change(v)
     await sleep(0.1)
@@ -465,7 +549,7 @@ async def test_unsubscribe_two_objects_consecutively(opc):
     ]
     sub = await opc.opc.create_subscription(100, handler)
     handles = await sub.subscribe_data_change(nodes, queuesize=1)
-    assert type(handles) is list
+    assert isinstance(handles, list)
     await handler.done()
     for handle in handles:
         await sub.unsubscribe(handle)
@@ -485,7 +569,7 @@ async def test_subscribe_events_to_wrong_node(opc):
     with pytest.raises(ua.UaStatusCodeError):
         _ = await sub.subscribe_events(opc.opc.get_node("i=85"))
     o = opc.opc.nodes.objects
-    v = await o.add_variable(3, 'VariableNoEventNofierAttribute', 4)
+    v = await o.add_variable(3, "VariableNoEventNofierAttribute", 4)
     with pytest.raises(ua.UaStatusCodeError):
         _ = await sub.subscribe_events(v)
     await sub.delete()
@@ -520,6 +604,16 @@ async def test_get_event_attributes_from_type_node_AlarmConditionType(opc):
         assert child in allVariables
 
 
+async def test_get_filter(opc):
+    auditType = opc.opc.get_node(ua.ObjectIds.AuditEventType)
+    baseType = opc.opc.get_node(ua.ObjectIds.BaseEventType)
+    properties = await baseType.get_properties()
+    properties.extend(await auditType.get_properties())
+    evfilter = await asyncua.common.events.get_filter_from_event_type([auditType])
+    # Check number of elements in select clause
+    assert len(evfilter.SelectClauses) == len(properties)
+
+
 async def test_get_filter_from_ConditionType(opc):
     condType = opc.opc.get_node(ua.ObjectIds.ConditionType)
     baseType = opc.opc.get_node(ua.ObjectIds.BaseEventType)
@@ -532,13 +626,15 @@ async def test_get_filter_from_ConditionType(opc):
         subproperties.extend(await var.get_properties())
     evfilter = await asyncua.common.events.get_filter_from_event_type([condType])
     # Check number of elements in select clause
-    assert len(evfilter.SelectClauses) == (len(properties) + len(variables) + len(subproperties))
+    assert len(evfilter.SelectClauses) == (len(properties) + len(variables) + len(subproperties) + 1)
     # Check browse path variable with property
     browsePathList = [o.BrowsePath for o in evfilter.SelectClauses if o.BrowsePath]
     browsePathEnabledState = [ua.uatypes.QualifiedName("EnabledState")]
     browsePathEnabledStateId = [ua.uatypes.QualifiedName("EnabledState"), ua.uatypes.QualifiedName("Id")]
     assert browsePathEnabledState in browsePathList
     assert browsePathEnabledStateId in browsePathList
+    # Check for additional NodeId attribute, which is not directly contained in ConditionType
+    assert len([o for o in evfilter.SelectClauses if o.AttributeId == ua.AttributeIds.NodeId]) == 1
     # Check some subtypes in where clause
     alarmType = opc.opc.get_node(ua.ObjectIds.AlarmConditionType)
     systemType = opc.opc.get_node(ua.ObjectIds.SystemOffNormalAlarmType)
@@ -549,18 +645,20 @@ async def test_get_filter_from_ConditionType(opc):
 
 
 async def test_get_event_contains_object(opc):
-    """ Shelving State is a object this should be in the filter list!"""
+    """Shelving State is a object this should be in the filter list!"""
     alarm_type = opc.opc.get_node(ua.ObjectIds.AlarmConditionType)
     evfilter = await asyncua.common.events.get_filter_from_event_type([alarm_type])
     browsePathList = [o.BrowsePath for o in evfilter.SelectClauses if o.BrowsePath]
-    browsePathId = [ua.QualifiedName('ShelvingState'), ua.QualifiedName('CurrentState'), ua.QualifiedName('Id')]
+    browsePathId = [ua.QualifiedName("ShelvingState"), ua.QualifiedName("CurrentState"), ua.QualifiedName("Id")]
     assert browsePathId in browsePathList
 
 
 async def test_get_event_from_type_node_CustomEvent(opc):
     etype = await opc.server.create_custom_event_type(
-        2, 'MyEvent', ua.ObjectIds.AuditEventType,
-        [('PropertyNum', ua.VariantType.Float), ('PropertyString', ua.VariantType.String)]
+        2,
+        "MyEvent",
+        ua.ObjectIds.AuditEventType,
+        [("PropertyNum", ua.VariantType.Float), ("PropertyString", ua.VariantType.String)],
     )
     properties = await asyncua.common.events.get_event_properties_from_type_node(etype)
     for child in await opc.opc.get_node(ua.ObjectIds.BaseEventType).get_properties():
@@ -579,7 +677,7 @@ async def test_events_default(opc):
     myhandler = MySubHandler()
     sub = await opc.opc.create_subscription(100, myhandler)
     handle = await sub.subscribe_events()
-    tid = datetime.utcnow()
+    tid = datetime.now(timezone.utc)
     msg = "this is my msg "
     await evgen.trigger(tid, msg)
     ev = await myhandler.result()
@@ -596,19 +694,19 @@ async def test_events_default(opc):
 
 async def test_events_MyObject(opc):
     objects = opc.server.nodes.objects
-    o = await objects.add_object(3, 'MyObject')
+    o = await objects.add_object(3, "MyObject")
     evgen = await opc.server.get_event_generator(emitting_node=o)
     myhandler = MySubHandler()
     sub = await opc.opc.create_subscription(100, myhandler)
     handle = await sub.subscribe_events(o)
-    tid = datetime.utcnow()
+    tid = datetime.now(timezone.utc)
     msg = "this is my msg "
     await evgen.trigger(tid, msg)
     ev = await myhandler.result()
     assert ev is not None  # we did not receive event
     assert ua.NodeId(ua.ObjectIds.BaseEventType) == ev.EventType
     assert 1 == ev.Severity
-    assert 'MyObject' == ev.SourceName
+    assert "MyObject" == ev.SourceName
     assert o.nodeid == ev.SourceNode
     assert msg == ev.Message.Text
     assert tid == ev.Time
@@ -619,12 +717,12 @@ async def test_events_MyObject(opc):
 
 async def test_events_wrong_source(opc):
     objects = opc.server.nodes.objects
-    o = await objects.add_object(3, 'MyObject')
+    o = await objects.add_object(3, "MyObject")
     evgen = await opc.server.get_event_generator(emitting_node=o)
     myhandler = MySubHandler()
     sub = await opc.opc.create_subscription(100, myhandler)
     handle = await sub.subscribe_events()
-    tid = datetime.utcnow()
+    tid = datetime.now(timezone.utc)
     msg = "this is my msg "
     await evgen.trigger(tid, msg)
     with pytest.raises(TimeoutError):  # we should not receive event
@@ -635,10 +733,12 @@ async def test_events_wrong_source(opc):
 
 
 async def test_events_CustomEvent(opc):
-    etype = await opc.server.create_custom_event_type(2, 'MyEvent', ua.ObjectIds.BaseEventType, [
-        ('PropertyNum', ua.VariantType.Float),
-        ('PropertyString', ua.VariantType.String)
-    ])
+    etype = await opc.server.create_custom_event_type(
+        2,
+        "MyEvent",
+        ua.ObjectIds.BaseEventType,
+        [("PropertyNum", ua.VariantType.Float), ("PropertyString", ua.VariantType.String)],
+    )
     evgen = await opc.server.get_event_generator(etype)
     myhandler = MySubHandler()
     sub = await opc.opc.create_subscription(100, myhandler)
@@ -649,7 +749,7 @@ async def test_events_CustomEvent(opc):
     evgen.event.PropertyString = propertystring
     serverity = 500
     evgen.event.Severity = serverity
-    tid = datetime.utcnow()
+    tid = datetime.now(timezone.utc)
     msg = "this is my msg "
     await evgen.trigger(tid, msg)
     ev = await myhandler.result()
@@ -668,14 +768,20 @@ async def test_events_CustomEvent(opc):
 
 
 async def test_events_CustomEvent_CustomFilter(opc):
-    etype = await opc.server.create_custom_event_type(2, 'MyEventCustom', ua.ObjectIds.ProgramTransitionAuditEventType,
-                                                      [('NodeId', ua.VariantType.NodeId), ('PropertyString', ua.VariantType.String)])
+    etype = await opc.server.create_custom_event_type(
+        2,
+        "MyEventCustom",
+        ua.ObjectIds.ProgramTransitionAuditEventType,
+        [("NodeId", ua.VariantType.NodeId), ("PropertyString", ua.VariantType.String)],
+    )
     # Create Custom Event filter including AttributeId.NodeId
     efilter = ua.EventFilter()
-    browsePathes = [[ua.uatypes.QualifiedName("PropertyString", 2)],
-                    [ua.uatypes.QualifiedName("Transition"), ua.uatypes.QualifiedName("Id")],
-                    [ua.uatypes.QualifiedName("Message")],
-                    [ua.uatypes.QualifiedName("EventType")]]
+    browsePathes = [
+        [ua.uatypes.QualifiedName("PropertyString", 2)],
+        [ua.uatypes.QualifiedName("Transition"), ua.uatypes.QualifiedName("Id")],
+        [ua.uatypes.QualifiedName("Message")],
+        [ua.uatypes.QualifiedName("EventType")],
+    ]
     # SelectClause
     for bp in browsePathes:
         op = ua.SimpleAttributeOperand()
@@ -724,10 +830,13 @@ async def test_events_CustomEvent_CustomFilter(opc):
 
 async def test_events_CustomEvent_MyObject(opc):
     objects = opc.server.nodes.objects
-    o = await objects.add_object(3, 'MyObject')
-    etype = await opc.server.create_custom_event_type(2, 'MyEvent', ua.ObjectIds.BaseEventType,
-                                                      [('PropertyNum', ua.VariantType.Float),
-                                                       ('PropertyString', ua.VariantType.String)])
+    o = await objects.add_object(3, "MyObject")
+    etype = await opc.server.create_custom_event_type(
+        2,
+        "MyEvent",
+        ua.ObjectIds.BaseEventType,
+        [("PropertyNum", ua.VariantType.Float), ("PropertyString", ua.VariantType.String)],
+    )
     evgen = await opc.server.get_event_generator(etype, emitting_node=o)
     myhandler = MySubHandler()
     sub = await opc.opc.create_subscription(100, myhandler)
@@ -736,14 +845,14 @@ async def test_events_CustomEvent_MyObject(opc):
     propertystring = "This is my test"
     evgen.event.PropertyNum = propertynum
     evgen.event.PropertyString = propertystring
-    tid = datetime.utcnow()
+    tid = datetime.now(timezone.utc)
     msg = "this is my msg "
     await evgen.trigger(tid, msg)
     ev = await myhandler.result()
     assert ev is not None  # we did not receive event
     assert etype.nodeid == ev.EventType
     assert 1 == ev.Severity
-    assert 'MyObject' == ev.SourceName
+    assert "MyObject" == ev.SourceName
     assert o.nodeid == ev.SourceNode
     assert msg == ev.Message.Text
     assert tid == ev.Time
@@ -756,14 +865,20 @@ async def test_events_CustomEvent_MyObject(opc):
 
 async def test_several_different_events(opc):
     objects = opc.server.nodes.objects
-    o = await objects.add_object(3, 'MyObject')
-    etype1 = await opc.server.create_custom_event_type(2, 'MyEvent1', ua.ObjectIds.BaseEventType,
-                                                       [('PropertyNum', ua.VariantType.Float),
-                                                        ('PropertyString', ua.VariantType.String)])
+    o = await objects.add_object(3, "MyObject")
+    etype1 = await opc.server.create_custom_event_type(
+        2,
+        "MyEvent1",
+        ua.ObjectIds.BaseEventType,
+        [("PropertyNum", ua.VariantType.Float), ("PropertyString", ua.VariantType.String)],
+    )
     evgen1 = await opc.server.get_event_generator(etype1, o)
-    etype2 = await opc.server.create_custom_event_type(2, 'MyEvent2', ua.ObjectIds.BaseEventType,
-                                                       [('PropertyNum', ua.VariantType.Float),
-                                                        ('PropertyString', ua.VariantType.String)])
+    etype2 = await opc.server.create_custom_event_type(
+        2,
+        "MyEvent2",
+        ua.ObjectIds.BaseEventType,
+        [("PropertyNum", ua.VariantType.Float), ("PropertyString", ua.VariantType.String)],
+    )
     evgen2 = await opc.server.get_event_generator(etype2, o)
     myhandler = MySubHandler2()
     sub = await opc.opc.create_subscription(100, myhandler)
@@ -801,20 +916,26 @@ async def test_several_different_events(opc):
 
 async def test_several_different_events_2(opc):
     objects = opc.server.nodes.objects
-    o = await objects.add_object(3, 'MyObject')
+    o = await objects.add_object(3, "MyObject")
     etype1 = await opc.server.create_custom_event_type(
-        2, 'MyEvent1', ua.ObjectIds.BaseEventType,
-        [('PropertyNum', ua.VariantType.Float), ('PropertyString', ua.VariantType.String)]
+        2,
+        "MyEvent1",
+        ua.ObjectIds.BaseEventType,
+        [("PropertyNum", ua.VariantType.Float), ("PropertyString", ua.VariantType.String)],
     )
     evgen1 = await opc.server.get_event_generator(etype1, o)
     etype2 = await opc.server.create_custom_event_type(
-        2, 'MyEvent2', ua.ObjectIds.BaseEventType,
-        [('PropertyNum2', ua.VariantType.Float), ('PropertyString', ua.VariantType.String)]
+        2,
+        "MyEvent2",
+        ua.ObjectIds.BaseEventType,
+        [("PropertyNum2", ua.VariantType.Float), ("PropertyString", ua.VariantType.String)],
     )
     evgen2 = await opc.server.get_event_generator(etype2, o)
     etype3 = await opc.server.create_custom_event_type(
-        2, 'MyEvent3', ua.ObjectIds.BaseEventType,
-        [('PropertyNum3', ua.VariantType.Float), ('PropertyString', ua.VariantType.String)]
+        2,
+        "MyEvent3",
+        ua.ObjectIds.BaseEventType,
+        [("PropertyNum3", ua.VariantType.Float), ("PropertyString", ua.VariantType.String)],
     )
     evgen3 = await opc.server.get_event_generator(etype3, o)
     myhandler = MySubHandler2()
@@ -862,11 +983,11 @@ async def test_internal_server_subscription(opc):
     data of a node changes (by external client and internally).
     """
     sub_handler = MySubHandler2()
-    uri = 'http://examples.freeopcua.github.io'
+    uri = "http://examples.freeopcua.github.io"
     idx = await opc.server.register_namespace(uri)
     objects = opc.server.nodes.objects
-    sub_obj = await objects.add_object(idx, 'SubTestObject')
-    sub_var = await sub_obj.add_variable(idx, 'SubTestVariable', 0)
+    sub_obj = await objects.add_object(idx, "SubTestObject")
+    sub_var = await sub_obj.add_variable(idx, "SubTestVariable", 0)
     sub = await opc.server.create_subscription(1, sub_handler)
     # Server subscribes to own variable data changes
     await sub.subscribe_data_change([sub_var])
@@ -895,18 +1016,12 @@ async def test_maxkeepalive_count(opc, mocker):
         SubscriptionId=78,
         RevisedPublishingInterval=mock_period,
         RevisedLifetimeCount=10000,
-        RevisedMaxKeepAliveCount=2700
+        RevisedMaxKeepAliveCount=2700,
     )
     mock_create_subscription = mocker.patch.object(
-        client.uaclient,
-        "create_subscription",
-        new=AsyncMock(return_value=mock_response)
+        client.uaclient, "create_subscription", new=AsyncMock(return_value=mock_response)
     )
-    mock_update_subscription = mocker.patch.object(
-        client.uaclient,
-        "update_subscription",
-        new=AsyncMock()
-    )
+    mock_update_subscription = mocker.patch.object(client.uaclient, "update_subscription", new=AsyncMock())
 
     sub = await client.create_subscription(period, sub_handler)
     assert sub.parameters.RequestedMaxKeepAliveCount == mock_max_keepalive_count
@@ -920,9 +1035,9 @@ async def test_maxkeepalive_count(opc, mocker):
             RequestedMaxKeepAliveCount=mock_max_keepalive_count,
             MaxNotificationsPerPublish=10000,
             PublishingEnabled=True,
-            Priority=0
+            Priority=0,
         ),
-        callback=mocker.ANY
+        callback=mocker.ANY,
     )
     mock_update_subscription.assert_awaited_with(
         ua.ModifySubscriptionParameters(
@@ -930,7 +1045,7 @@ async def test_maxkeepalive_count(opc, mocker):
             RequestedPublishingInterval=mock_period,
             RequestedLifetimeCount=10000,
             RequestedMaxKeepAliveCount=mock_max_keepalive_count,
-            MaxNotificationsPerPublish=10000
+            MaxNotificationsPerPublish=10000,
         )
     )
 
@@ -939,3 +1054,64 @@ async def test_maxkeepalive_count(opc, mocker):
     mock_create_subscription.reset_mock()
     sub = await client.create_subscription(mock_period, sub_handler)
     mock_update_subscription.assert_not_called()
+
+
+@pytest.mark.parametrize("opc", ["client"], indirect=True)
+async def test_publish(opc, mocker):
+    client, _ = opc
+
+    o = opc.opc.nodes.objects
+    var = await o.add_variable(3, "SubscriptionVariable", 0)
+
+    publish_event = asyncio.Event()
+    publish_org = client.uaclient.publish
+
+    async def publish(acks):
+        await publish_event.wait()
+        publish_event.clear()
+        return await publish_org(acks)
+
+    class PublishCallback:
+        def __init__(self):
+            self.fut = asyncio.Future()
+
+        def reset(self):
+            self.fut = Future()
+
+        def set_result(self, publish_result):
+            values = []
+            if publish_result.NotificationMessage.NotificationData is not None:
+                for notif in publish_result.NotificationMessage.NotificationData:
+                    if isinstance(notif, ua.DataChangeNotification):
+                        values.extend(item.Value.Value.Value for item in notif.MonitoredItems)
+            self.fut.set_result(values)
+
+        async def result(self):
+            return await wait_for(asyncio.shield(self.fut), 1)
+
+    publish_callback = PublishCallback()
+
+    mocker.patch.object(asyncua.common.subscription.Subscription, "publish_callback", publish_callback.set_result)
+    mocker.patch.object(client.uaclient, "publish", publish)
+
+    sub = await client.create_subscription(30, None)
+    await sub.subscribe_data_change(var, queuesize=2)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await publish_callback.result()
+
+    publish_event.set()
+    result = await publish_callback.result()
+    publish_callback.reset()
+    assert result == [0]
+
+    for val in [1, 2, 3, 4]:
+        await var.write_value(val)
+        await asyncio.sleep(0.1)
+    with pytest.raises(asyncio.TimeoutError):
+        await publish_callback.result()
+
+    publish_event.set()
+    result = await publish_callback.result()
+    publish_callback.reset()
+    assert result == [3, 4]

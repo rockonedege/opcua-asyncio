@@ -1,18 +1,19 @@
 import asyncio
 import logging
-from asyncua import Server, ua, Node
+from asyncua import Server, ua
 from asyncua.common.statemachine import FiniteStateMachine, State, Transition
 
 logging.basicConfig(level=logging.INFO)
-_logger = logging.getLogger('asyncua')
+_logger = logging.getLogger("asyncua")
 
 if __name__ == "__main__":
+
     async def main():
         server = Server()
         await server.init()
         server.set_endpoint("opc.tcp://0.0.0.0:4840/freeopcua/server/")
         idx = await server.register_namespace("http://examples.freeopcua.github.io")
-        
+
         # get a instance of the FiniteStateMachine-Class def "__init__(self, server=None, parent=None, idx=None, name=None):"
         mystatemachine = FiniteStateMachine(server, server.nodes.objects, idx, "FiniteStateMachine")
         # call statemachine.install() to instantiate the statemachinetype (with or without optional nodes)
@@ -22,7 +23,9 @@ if __name__ == "__main__":
         # if the state node already exist for example from xml model you can assign it here: node=<StateNode>
         state1 = State("State-Id-1", "Idle", 1, node=None)
         # adds the state (StateType) to the statemachine childs - this is mandatory for the FiniteStateMachine!
-        await mystatemachine.add_state(state1, state_type=ua.NodeId(2309, 0)) #this is a init state -> InitialStateType: ua.NodeId(2309, 0)
+        await mystatemachine.add_state(
+            state1, state_type=ua.NodeId(2309, 0)
+        )  # this is a init state -> InitialStateType: ua.NodeId(2309, 0)
         state2 = State("State-Id-2", "Loading", 2)
         await mystatemachine.add_state(state2)
         state3 = State("State-Id-3", "Initializing", 3)
@@ -34,16 +37,12 @@ if __name__ == "__main__":
 
         # sets the avalible states of the FiniteStateMachine
         # this is mandatory!
-        await mystatemachine.set_available_states([
-            state1.node.nodeid,
-            state2.node.nodeid,
-            state3.node.nodeid,
-            state4.node.nodeid,
-            state5.node.nodeid
-        ])
+        await mystatemachine.set_available_states(
+            [state1.node.nodeid, state2.node.nodeid, state3.node.nodeid, state4.node.nodeid, state5.node.nodeid]
+        )
 
-        # setup your transition helperclass 
-        # if the transition node already exist for example from xml model you can assign it here: node=<TransitionNode> 
+        # setup your transition helperclass
+        # if the transition node already exist for example from xml model you can assign it here: node=<TransitionNode>
         trans1 = Transition("Transition-Id-1", "to Idle", 1)
         # adds the transition (TransitionType) to the statemachine childs - this is optional for the FiniteStateMachine
         await mystatemachine.add_transition(trans1)
@@ -57,16 +56,12 @@ if __name__ == "__main__":
         await mystatemachine.add_transition(trans5)
 
         # this is optional for the FiniteStateMachine
-        await mystatemachine.set_available_transitions([
-            trans1.node.nodeid,
-            trans2.node.nodeid,
-            trans3.node.nodeid,
-            trans4.node.nodeid,
-            trans5.node.nodeid
-        ])
+        await mystatemachine.set_available_transitions(
+            [trans1.node.nodeid, trans2.node.nodeid, trans3.node.nodeid, trans4.node.nodeid, trans5.node.nodeid]
+        )
 
         # initialise the FiniteStateMachine by call change_state() with the InitialState
-        # if the statechange should trigger an TransitionEvent the Message can be assigned here 
+        # if the statechange should trigger an TransitionEvent the Message can be assigned here
         # if event_msg is None no event will be triggered
         await mystatemachine.change_state(state1, trans1, f"{mystatemachine._name}: Idle", 300)
 

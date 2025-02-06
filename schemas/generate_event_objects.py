@@ -46,7 +46,7 @@ Model Uri:{model_.attrib['ModelUri']}"
 Version:{model_.attrib['Version']}"
 Publication date:{model_.attrib['PublicationDate']}"
 
-File creation Date:{datetime.datetime.utcnow()}"
+File creation Date:{datetime.datetime.now(datetime.timezone.utc)}"
 """
 from asyncua import ua
 from .events import Event
@@ -80,7 +80,7 @@ from .events import Event
             return "ua.LocalizedText(message)"
         elif reference.refBrowseName == "LocalTime":
             return "ua.uaprotocol_auto.TimeZoneDataType()"
-        elif reference.refDataType == "NodeId":
+        elif reference.refBrowseName == "EventType":
             return "ua.NodeId(ua.ObjectIds.{0})".format(
                 str(ob_ids.ObjectIdNames[int(str(reference.refId).split("=")[1])]).split("_")[0])
         else:

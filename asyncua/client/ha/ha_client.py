@@ -10,19 +10,19 @@ from sortedcontainers import SortedDict  # type: ignore
 from asyncua import Node, ua, Client
 from asyncua.client.ua_client import UASocketProtocol
 from asyncua.ua.uaerrors import BadSessionClosed, BadSessionNotActivated
-from typing import Dict, Generator, Iterable, List, Optional, Set, Tuple, Type, Union
+from typing import Dict, Generator, Iterable, List, Optional, Set, Tuple, Type, Union, Sequence
 
 from .reconciliator import Reconciliator
 from .common import ClientNotFound, event_wait
 from .virtual_subscription import TypeSubHandler, VirtualSubscription
 from ...crypto.uacrypto import CertProperties
+from ...crypto.security_policies import SecurityPolicy
 
 
 _logger = logging.getLogger(__name__)
 
 
 class HaMode(IntEnum):
-
     # OPC UA Part 4 - 6.6.2.4.5.2 - Cold
     # Only connect to the active_client, failover is managed by
     # promoting another client of the pool to active_client
@@ -65,7 +65,7 @@ class ServerInfo:
 
 @dataclass(frozen=True, eq=True)
 class HaSecurityConfig:
-    policy: Optional[Type[ua.SecurityPolicy]] = None
+    policy: Optional[Type[SecurityPolicy]] = None
     certificate: Optional[CertProperties] = None
     private_key: Optional[CertProperties] = None
     server_certificate: Optional[CertProperties] = None
@@ -107,9 +107,7 @@ class HaClient:
     # i.e: You're using an OPC-UA proxy
     HEALTHY_STATE = ConnectionStates.HEALTHY
 
-    def __init__(
-        self, config: HaConfig, security: Optional[HaSecurityConfig] = None
-    ) -> None:
+    def __init__(self, config: HaConfig, security: Optional[HaSecurityConfig] = None) -> None:
         self._config: HaConfig = config
         self._keepalive_task: Dict[KeepAlive, asyncio.Task] = {}
         self._manager_task: Dict[HaManager, asyncio.Task] = {}
@@ -133,9 +131,7 @@ class HaClient:
             # TODO
             # Check if transparent redundancy support exist for the server (nodeid=2035)
             # and prevent using HaClient with such servers.
-            raise NotImplementedError(
-                f"{config.ha_mode} not currently supported by HaClient"
-            )
+            raise NotImplementedError(f"{config.ha_mode} not currently supported by HaClient")
 
         for url in self.urls:
             c = Client(url, timeout=self._config.request_timeout)
@@ -148,9 +144,7 @@ class HaClient:
             self.ideal_map[url] = SortedDict()
 
         # security can also be set via the set_security method
-        self.security_config: HaSecurityConfig = (
-            security if security else HaSecurityConfig()
-        )
+        self.security_config: HaSecurityConfig = security if security else HaSecurityConfig()
         self.manager = HaManager(self, self._config.manager_timer)
         self.reconciliator = Reconciliator(self._config.reconciliator_timer, self)
 
@@ -169,7 +163,7 @@ class HaClient:
         self.is_running = True
 
     async def stop(self):
-        to_stop = chain(
+        to_stop: Sequence[Union[KeepAlive, HaManager, Reconciliator]] = chain(
             self._keepalive_task, self._manager_task, self._reconciliator_task
         )
         stop = [p.stop() for p in to_stop]
@@ -197,16 +191,13 @@ class HaClient:
 
     def set_security(
         self,
-        policy: Type[ua.SecurityPolicy],
+        policy: Type[SecurityPolicy],
         certificate: CertProperties,
         private_key: CertProperties,
         server_certificate: Optional[CertProperties] = None,
         mode: ua.MessageSecurityMode = ua.MessageSecurityMode.SignAndEncrypt,
     ) -> None:
-
-        self.security_config = HaSecurityConfig(
-            policy, certificate, private_key, server_certificate, mode
-        )
+        self.security_config = HaSecurityConfig(policy, certificate, private_key, server_certificate, mode)
 
     async def create_subscription(self, period: int, handler: TypeSubHandler) -> str:
         async with self._ideal_map_lock:
@@ -237,20 +228,18 @@ class HaClient:
         attr=ua.AttributeIds.Value,
         queuesize=0,
     ) -> None:
-
         async with self._ideal_map_lock:
-            nodes = [n.nodeid.to_string() if isinstance(n, Node) else n for n in nodes]
+            # FIXME: nodeid can be None
+            nodes = [n.nodeid.to_string() if isinstance(n, Node) else n for n in nodes]  # type: ignore[union-attr]
             for url in self.urls:
                 vs = self.ideal_map[url].get(sub_name)
                 if not vs:
                     _logger.warning(
-                        f"The subscription specified for the data_change: {sub_name} doesn't exist in ideal_map"
+                        "The subscription specified for the data_change: %s doesn't exist in ideal_map", sub_name
                     )
                     return
                 vs.subscribe_data_change(nodes, attr, queuesize)
-                await self.hook_on_subscribe(
-                    nodes=nodes, attr=attr, queuesize=queuesize, url=url
-                )
+                await self.hook_on_subscribe(nodes=nodes, attr=attr, queuesize=queuesize, url=url)
 
     async def delete_subscriptions(self, sub_names: List[str]) -> None:
         async with self._ideal_map_lock:
@@ -259,9 +248,7 @@ class HaClient:
                     if self.ideal_map[url].get(sub_name):
                         self.ideal_map[url].pop(sub_name)
                     else:
-                        _logger.warning(
-                            f"No subscription named {sub_name} in ideal_map"
-                        )
+                        _logger.warning("No subscription named %s in ideal_map", sub_name)
                 self.sub_names.remove(sub_name)
 
     async def reconnect(self, client: Client) -> None:
@@ -286,8 +273,10 @@ class HaClient:
             sub_to_nodes = {}
             first_url = self.urls[0]
             for sub_name, vs in self.ideal_map[first_url].items():
+                # FIXME: nodeid can be None
                 node_set = {
-                    n.nodeid.to_string() if isinstance(n, Node) else n for n in nodes
+                    n.nodeid.to_string() if isinstance(n, Node) else n
+                    for n in nodes  # type: ignore[union-attr]
                 }
                 to_del = node_set & vs.get_nodes()
                 if to_del:
@@ -298,22 +287,16 @@ class HaClient:
                     vs.unsubscribe(str_nodes)
                     await self.hook_on_unsubscribe(url=url, nodes=str_nodes)
 
-    async def failover_warm(
-        self, primary: Optional[Client], secondaries: Iterable[Client]
-    ) -> None:
+    async def failover_warm(self, primary: Optional[Client], secondaries: Iterable[Client]) -> None:
         async with self._ideal_map_lock:
             if primary:
-                self._set_monitoring_mode(
-                    ua.MonitoringMode.Reporting, clients=[primary]
-                )
+                self._set_monitoring_mode(ua.MonitoringMode.Reporting, clients=[primary])
                 self._set_publishing_mode(True, clients=[primary])
             self.active_client = primary
             self._set_monitoring_mode(ua.MonitoringMode.Disabled, clients=secondaries)
             self._set_publishing_mode(False, clients=secondaries)
 
-    def _set_monitoring_mode(
-        self, monitoring: ua.MonitoringMode, clients: Iterable[Client]
-    ) -> None:
+    def _set_monitoring_mode(self, monitoring: ua.MonitoringMode, clients: Iterable[Client]) -> None:
         for client in clients:
             url = client.server_url.geturl()
             for sub in self.ideal_map[url]:
@@ -338,9 +321,7 @@ class HaClient:
                     unhealthy.append(client)
             return healthy, unhealthy
 
-    async def get_serving_client(
-        self, clients: List[Client], serving_client: Optional[Client]
-    ) -> Optional[Client]:
+    async def get_serving_client(self, clients: List[Client], serving_client: Optional[Client]) -> Optional[Client]:
         """
         Returns the client with the higher service level.
 
@@ -444,35 +425,40 @@ class KeepAlive:
         # wait for HaManager to connect clients
         await asyncio.sleep(3)
         self.is_running = True
-        _logger.info(
-            f"Starting keepalive loop for {server_info.url}, checking every {self.timer}sec"
-        )
+        _logger.info("Starting keepalive loop for %s, checking every %dsec", server_info.url, self.timer)
         while self.is_running:
-            try:
-                status, slevel = await client.read_values([status_node, slevel_node])
-                if status != ua.ServerState.Running:
-                    _logger.info("ServerState is not running")
+            if client.uaclient.protocol is None:
+                server_info.status = ConnectionStates.NO_DATA
+                _logger.info("No active client")
+            else:
+                try:
+                    status, slevel = await client.read_values([status_node, slevel_node])
+                    if status != ua.ServerState.Running:
+                        _logger.info("ServerState is not running")
+                        server_info.status = ConnectionStates.NO_DATA
+                    else:
+                        server_info.status = slevel
+                except BadSessionNotActivated:
+                    _logger.warning("Session is not yet activated.")
                     server_info.status = ConnectionStates.NO_DATA
-                else:
-                    server_info.status = slevel
-            except BadSessionNotActivated:
-                _logger.warning("Session is not yet activated.")
-                server_info.status = ConnectionStates.NO_DATA
-            except BadSessionClosed:
-                _logger.warning("Session is closed.")
-                server_info.status = ConnectionStates.NO_DATA
-            except asyncio.TimeoutError:
-                _logger.warning("Timeout when fetching state")
-                server_info.status = ConnectionStates.NO_DATA
-            except asyncio.CancelledError:
-                _logger.warning("CancelledError, this means we should shutdown")
-                server_info.status = ConnectionStates.NO_DATA
-                # FIXME: It cannot be correct to catch CancelledError here, we should re-raise
-            except Exception:
-                _logger.exception("Unknown exception during keepalive liveness check")
-                server_info.status = ConnectionStates.NO_DATA
+                except BadSessionClosed:
+                    _logger.warning("Session is closed.")
+                    server_info.status = ConnectionStates.NO_DATA
+                except ConnectionError:
+                    _logger.warning("No connection.")
+                    server_info.status = ConnectionStates.NO_DATA
+                except asyncio.TimeoutError:
+                    _logger.warning("Timeout when fetching state")
+                    server_info.status = ConnectionStates.NO_DATA
+                except asyncio.CancelledError:
+                    _logger.warning("CancelledError, this means we should shutdown")
+                    server_info.status = ConnectionStates.NO_DATA
+                    # FIXME: It cannot be correct to catch CancelledError here, we should re-raise
+                except Exception:
+                    _logger.exception("Unknown exception during keepalive liveness check")
+                    server_info.status = ConnectionStates.NO_DATA
 
-            _logger.info(f"ServiceLevel for {server_info.url}: {server_info.status}")
+            _logger.info("ServiceLevel for %s: %s", server_info.url, server_info.status)
             if await event_wait(self.stop_event, self.timer):
                 self.is_running = False
                 break
@@ -485,7 +471,6 @@ class HaManager:
     """
 
     def __init__(self, ha_client: HaClient, timer: Optional[int] = None) -> None:
-
         self.ha_client = ha_client
         self.timer = self.set_loop_timer(timer)
         self.stop_event = asyncio.Event()
@@ -502,9 +487,8 @@ class HaManager:
         reconnect = getattr(self, reco_func)
         self.is_running = True
 
-        _logger.info(f"Starting HaManager loop, checking every {self.timer}sec")
+        _logger.info("Starting HaManager loop, checking every %dsec", self.timer)
         while self.is_running:
-
             # failover happens here
             await update_state()
             await reconnect()
@@ -520,20 +504,12 @@ class HaManager:
     async def update_state_warm(self) -> None:
         active_client = self.ha_client.active_client
         clients = self.ha_client.get_clients()
-        primary_client = await self.ha_client.get_serving_client(
-            list(self.ha_client.clients), active_client
-        )
+        primary_client = await self.ha_client.get_serving_client(list(self.ha_client.clients), active_client)
         if primary_client != active_client:
             # disable monitoring and reporting when the service_level goes below 200
-            _logger.info(
-                f"Failing over active client from {active_client} to {primary_client}"
-            )
-            secondaries = (
-                set(clients) - {primary_client} if primary_client else set(clients)
-            )
-            await self.ha_client.failover_warm(
-                primary=primary_client, secondaries=secondaries
-            )
+            _logger.info("Failing over active client from %s to %s", active_client, primary_client)
+            secondaries = set(clients) - {primary_client} if primary_client else set(clients)
+            await self.ha_client.failover_warm(primary=primary_client, secondaries=secondaries)
 
     async def reconnect_warm(self) -> None:
         """
@@ -548,12 +524,12 @@ class HaManager:
                 or client.uaclient.protocol
                 and client.uaclient.protocol.state == UASocketProtocol.CLOSED
             ):
-                _logger.info(f"Virtually reconnecting and resubscribing {client}")
+                _logger.info("Virtually reconnecting and resubscribing %s", client)
                 await self.ha_client.reconnect(client=client)
 
         def log_exception(client: Client, fut: asyncio.Task):
             if fut.exception():
-                _logger.warning(f"Error when reconnecting {client}: {fut.exception()}")
+                _logger.warning("Error when reconnecting %s: %s", client, fut.exception())
 
         tasks = []
         for client in healthy:

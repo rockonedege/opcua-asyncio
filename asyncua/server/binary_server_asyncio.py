@@ -1,6 +1,7 @@
 """
 Socket server forwarding request to internal server
 """
+
 import logging
 import asyncio
 from typing import Optional
@@ -11,7 +12,7 @@ from ..common.utils import Buffer, NotEnoughData
 from .uaprocessor import UaProcessor
 from .internal_server import InternalServer
 
-logger = logging.getLogger(__name__)
+_logger = logging.getLogger(__name__)
 
 
 class OPCUAProtocol(asyncio.Protocol):
@@ -23,7 +24,7 @@ class OPCUAProtocol(asyncio.Protocol):
         self.peer_name = None
         self.transport = None
         self.processor = None
-        self._buffer = b''
+        self._buffer = b""
         self.iserver: InternalServer = iserver
         self.policies = policies
         self.clients = clients
@@ -33,13 +34,13 @@ class OPCUAProtocol(asyncio.Protocol):
         self._task = None
 
     def __str__(self):
-        return f'OPCUAProtocol({self.peer_name}, {self.processor.session})'
+        return f"OPCUAProtocol({self.peer_name}, {self.processor.session})"
 
     __repr__ = __str__
 
     def connection_made(self, transport):
-        self.peer_name = transport.get_extra_info('peername')
-        logger.info('New connection from %s', self.peer_name)
+        self.peer_name = transport.get_extra_info("peername")
+        _logger.info("New connection from %s", self.peer_name)
         self.transport = transport
         self.processor = UaProcessor(self.iserver, self.transport, self.limits)
         self.processor.set_policies(self.policies)
@@ -48,7 +49,7 @@ class OPCUAProtocol(asyncio.Protocol):
         self._task = asyncio.create_task(self._process_received_message_loop())
 
     def connection_lost(self, ex):
-        logger.info('Lost connection from %s, %s', self.peer_name, ex)
+        _logger.info("Lost connection from %s, %s", self.peer_name, ex)
         self.transport.close()
         self.iserver.asyncio_transports.remove(self.transport)
         closing_task = asyncio.create_task(self.processor.close())
@@ -72,18 +73,20 @@ class OPCUAProtocol(asyncio.Protocol):
                     return
                 if header.header_size + header.body_size <= header.header_size:
                     # malformed header prevent invalid access of your buffer
-                    logger.error(f'Got malformed header {header}')
+                    _logger.error("Got malformed header %s", header)
                     self.transport.close()
                     return
                 else:
                     if len(buf) < header.body_size:
-                        logger.debug('We did not receive enough data from client. Need %s got %s', header.body_size, len(buf))
+                        _logger.debug(
+                            "We did not receive enough data from client. Need %s got %s", header.body_size, len(buf)
+                        )
                         return
                     # we have a complete message
                     self.messages.put_nowait((header, buf))
-                    self._buffer = self._buffer[(header.header_size + header.body_size):]
+                    self._buffer = self._buffer[(header.header_size + header.body_size) :]
             except Exception:
-                logger.exception('Exception raised while parsing message from client')
+                _logger.exception("Exception raised while parsing message from client")
                 return
 
     async def _process_received_message_loop(self):
@@ -98,13 +101,13 @@ class OPCUAProtocol(asyncio.Protocol):
             try:
                 await self._process_one_msg(header, buf)
             except Exception:
-                logger.exception('Exception raised while processing message from client')
+                _logger.exception("Exception raised while processing message from client")
 
     async def _process_one_msg(self, header, buf):
-        logger.debug('_process_received_message %s %s', header.body_size, len(buf))
+        _logger.debug("_process_received_message %s %s", header.body_size, len(buf))
         ret = await self.processor.process(header, buf)
         if not ret:
-            logger.info('processor returned False, we close connection from %s', self.peer_name)
+            _logger.info("processor returned False, we close connection from %s", self.peer_name)
             self.transport.close()
             return
 
@@ -132,7 +135,7 @@ class BinaryServer:
             policies=self._policies,
             clients=self.clients,
             closing_tasks=self.closing_tasks,
-            limits=self.limits
+            limits=self.limits,
         )
 
     async def start(self):
@@ -145,20 +148,22 @@ class BinaryServer:
             sockname = self._server.sockets[0].getsockname()
             self.hostname = sockname[0]
             self.port = sockname[1]
-        self.logger.info('Listening on %s:%s', self.hostname, self.port)
+        self.logger.info("Listening on %s:%s", self.hostname, self.port)
         self.cleanup_task = asyncio.create_task(self._close_task_loop())
 
     async def stop(self):
-        self.logger.info('Closing asyncio socket server')
+        self.logger.info("Closing asyncio socket server")
         for transport in self.iserver.asyncio_transports:
             transport.close()
 
         # stop cleanup process and run it a last time
-        self.cleanup_task.cancel()
-        try:
-            await self.cleanup_task
-        except asyncio.CancelledError:
-            pass
+        if self.cleanup_task is not None:
+            self.cleanup_task.cancel()
+            try:
+                await self.cleanup_task
+            except asyncio.CancelledError:
+                pass
+
         await self._close_tasks()
 
         if self._server:
@@ -176,4 +181,4 @@ class BinaryServer:
             try:
                 await task
             except Exception:
-                logger.exception("Unexpected crash in BinaryServer._close_tasks")
+                _logger.exception("Unexpected crash in BinaryServer._close_tasks")

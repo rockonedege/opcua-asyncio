@@ -1,20 +1,22 @@
+import asyncio
 import copy
 import time
 import logging
-from typing import Deque, Optional
+from typing import Deque, Optional, Dict
 from collections import deque
+from datetime import datetime, timedelta, timezone
 
 from asyncua import ua
 from ..ua.ua_binary import nodeid_from_binary, struct_from_binary, struct_to_binary, uatcp_to_binary
 from .internal_server import InternalServer, InternalSession
 from ..common.connection import SecureConnection, TransportLimits
 from ..common.utils import ServiceError
+from ..crypto.security_policies import SecurityPolicyNone
 
 _logger = logging.getLogger(__name__)
 
 
 class PublishRequestData:
-
     def __init__(self, requesthdr=None, seqhdr=None):
         self.requesthdr = requesthdr
         self.seqhdr = seqhdr
@@ -28,16 +30,21 @@ class UaProcessor:
 
     def __init__(self, internal_server: InternalServer, transport, limits: TransportLimits):
         self.iserver: InternalServer = internal_server
-        self.name = transport.get_extra_info('peername')
-        self.sockname = transport.get_extra_info('sockname')
+        self.name = transport.get_extra_info("peername")
+        self.sockname = transport.get_extra_info("sockname")
         self.session: Optional[InternalSession] = None
+        self.session_last_activity: Optional[datetime] = None
         self._transport = transport
         # deque for Publish Requests
         self._publish_requests: Deque[PublishRequestData] = deque()
-        # used when we need to wait for PublishRequest
-        self._publish_results: Deque[ua.PublishResult] = deque()
+        # queue for publish results callbacks (using SubscriptionId)
+        # rely on dict insertion order (therefore can't use set())
+        self._publish_results_subs: Dict[ua.IntegerId, bool] = {}
         self._limits = copy.deepcopy(limits)  # Copy limits because they get overriden
-        self._connection = SecureConnection(ua.SecurityPolicy(), self._limits)
+        self._connection = SecureConnection(SecurityPolicyNone(), self._limits)
+        self._closing: bool = False
+        self._session_watchdog_task: Optional[asyncio.Task] = None
+        self._watchdog_interval: float = 1.0
 
     def set_policies(self, policies):
         self._connection.set_policy_factories(policies)
@@ -45,7 +52,8 @@ class UaProcessor:
     def send_response(self, requesthandle, seqhdr, response, msgtype=ua.MessageType.SecureMessage):
         response.ResponseHeader.RequestHandle = requesthandle
         data = self._connection.message_to_binary(
-            struct_to_binary(response), message_type=msgtype, request_id=seqhdr.RequestId)
+            struct_to_binary(response), message_type=msgtype, request_id=seqhdr.RequestId
+        )
         self._transport.write(data)
 
     def open_secure_channel(self, algohdr, seqhdr, body):
@@ -55,7 +63,8 @@ class UaProcessor:
             # Only call select_policy if the channel isn't open. Otherwise
             # it will break the Secure channel renewal.
             self._connection.select_policy(
-                algohdr.SecurityPolicyURI, algohdr.SenderCertificate, request.Parameters.SecurityMode)
+                algohdr.SecurityPolicyURI, algohdr.SenderCertificate, request.Parameters.SecurityMode
+            )
 
         channel = self._connection.open(request.Parameters, self.iserver)
         # send response
@@ -63,27 +72,33 @@ class UaProcessor:
         response.Parameters = channel
         self.send_response(request.RequestHeader.RequestHandle, seqhdr, response, ua.MessageType.SecureOpen)
 
-    async def forward_publish_response(self, result: ua.PublishResult):
+    def get_publish_request(self, subscription_id: ua.IntegerId):
+        while True:
+            if not self._publish_requests:
+                # only store one callback per subscription
+                self._publish_results_subs[subscription_id] = True
+                _logger.info(
+                    "Server wants to send publish answer but no publish request is available,"
+                    "enqueuing publish results callback, length of queue is %s",
+                    len(self._publish_results_subs),
+                )
+                return None
+            # We pop left from the Publish Request deque (FIFO)
+            requestdata = self._publish_requests.popleft()
+            if (
+                requestdata.requesthdr.TimeoutHint == 0
+                or requestdata.requesthdr.TimeoutHint != 0
+                and time.time() - requestdata.timestamp < requestdata.requesthdr.TimeoutHint / 1000
+            ):
+                # Continue and use `requestdata` only if there was no timeout
+                break
+        return requestdata
+
+    async def forward_publish_response(self, result: ua.PublishResult, requestdata: PublishRequestData):
         """
         Try to send a `PublishResponse` with the given `PublishResult`.
         """
         # _logger.info("forward publish response %s", result)
-        while True:
-            if not self._publish_requests:
-                self._publish_results.append(result)
-                _logger.info(
-                    "Server wants to send publish answer but no publish request is available,"
-                    "enqueuing notification, length of result queue is %s",
-                    len(self._publish_results)
-                )
-                return
-            # We pop left from the Publish Request deque (FIFO)
-            requestdata = self._publish_requests.popleft()
-            if (requestdata.requesthdr.TimeoutHint == 0 or
-                    requestdata.requesthdr.TimeoutHint != 0 and
-                    time.time() - requestdata.timestamp < requestdata.requesthdr.TimeoutHint / 1000):
-                # Continue and use `requestdata` only if there was no timeout
-                break
         response = ua.PublishResponse()
         response.Parameters = result
         self.send_response(requestdata.requesthdr.RequestHandle, requestdata.seqhdr, response)
@@ -127,10 +142,10 @@ class UaProcessor:
         """
         typeid = nodeid_from_binary(body)
         requesthdr = struct_from_binary(ua.RequestHeader, body)
-        _logger.debug('process_message %r %r', typeid, requesthdr)
+        _logger.debug("process_message %r %r", typeid, requesthdr)
         try:
             return await self._process_message(typeid, requesthdr, seqhdr, body)
-        except ServiceError as e:
+        except (ServiceError, ua.uaerrors.UaStatusCodeError) as e:
             status = ua.StatusCode(e.code)
             response = ua.ServiceFault()
             response.ResponseHeader.ServiceResult = status
@@ -141,24 +156,28 @@ class UaProcessor:
             if self.session:
                 user = self.session.user
             else:
-                user = 'Someone'
+                user = "Someone"
             _logger.warning("%s attempted to do something they are not permitted to do", user)
             response = ua.ServiceFault()
             response.ResponseHeader.ServiceResult = ua.StatusCode(ua.StatusCodes.BadUserAccessDenied)
             self.send_response(requesthdr.RequestHandle, seqhdr, response)
         except Exception:
-            _logger.exception('Error while processing message')
+            _logger.exception("Error while processing message")
             response = ua.ServiceFault()
             response.ResponseHeader.ServiceResult = ua.StatusCode(ua.StatusCodes.BadInternalError)
             self.send_response(requesthdr.RequestHandle, seqhdr, response)
             return True
 
     async def _process_message(self, typeid, requesthdr, seqhdr, body):
-        if typeid in [ua.NodeId(ua.ObjectIds.CreateSessionRequest_Encoding_DefaultBinary),
-                      ua.NodeId(ua.ObjectIds.CloseSessionRequest_Encoding_DefaultBinary),
-                      ua.NodeId(ua.ObjectIds.ActivateSessionRequest_Encoding_DefaultBinary),
-                      ua.NodeId(ua.ObjectIds.FindServersRequest_Encoding_DefaultBinary),
-                      ua.NodeId(ua.ObjectIds.GetEndpointsRequest_Encoding_DefaultBinary)]:
+        if typeid in [
+            ua.NodeId(ua.ObjectIds.CreateSessionRequest_Encoding_DefaultBinary),
+            ua.NodeId(ua.ObjectIds.CloseSessionRequest_Encoding_DefaultBinary),
+            ua.NodeId(ua.ObjectIds.ActivateSessionRequest_Encoding_DefaultBinary),
+            ua.NodeId(ua.ObjectIds.FindServersRequest_Encoding_DefaultBinary),
+            ua.NodeId(ua.ObjectIds.GetEndpointsRequest_Encoding_DefaultBinary),
+            ua.NodeId(ua.ObjectIds.RegisterServerRequest_Encoding_DefaultBinary),
+            ua.NodeId(ua.ObjectIds.RegisterServer2Request_Encoding_DefaultBinary),
+        ]:
             # The connection is first created without a user being attached, and then during activation the
             user = None
         elif self.session is None:
@@ -170,6 +189,8 @@ class UaProcessor:
                 if self._connection.security_policy.permissions.check_validity(user, typeid, body) is False:
                     raise ua.uaerrors.BadUserAccessDenied
 
+        self.session_last_activity = datetime.now(timezone.utc)
+
         if typeid == ua.NodeId(ua.ObjectIds.CreateSessionRequest_Encoding_DefaultBinary):
             _logger.info("Create session request (%s)", user)
             params = struct_from_binary(ua.CreateSessionParameters, body)
@@ -177,6 +198,8 @@ class UaProcessor:
             self.session = self.iserver.create_session(self.name, external=True)
             # get a session creation result to send back
             sessiondata = await self.session.create_session(params, sockname=self.sockname)
+            self._closing = False
+            self._session_watchdog_task = asyncio.create_task(self._session_watchdog_loop())
             response = ua.CreateSessionResponse()
             response.Parameters = sessiondata
             response.Parameters.ServerCertificate = self._connection.security_policy.host_certificate
@@ -184,8 +207,9 @@ class UaProcessor:
                 data = params.ClientNonce
             else:
                 data = self._connection.security_policy.peer_certificate + params.ClientNonce
-            response.Parameters.ServerSignature.Signature = \
+            response.Parameters.ServerSignature.Signature = (
                 self._connection.security_policy.asymmetric_cryptography.signature(data)
+            )
             response.Parameters.ServerSignature.Algorithm = self._connection.security_policy.AsymmetricSignatureURI
             # _logger.info("sending create session response")
             self.send_response(requesthdr.RequestHandle, seqhdr, response)
@@ -194,6 +218,7 @@ class UaProcessor:
             _logger.info("Close session request (%s)", user)
             if self.session:
                 deletesubs = ua.ua_binary.Primitives.Boolean.unpack(body)
+                self._closing = True
                 await self.session.close_session(deletesubs)
             else:
                 _logger.info("Request to close non-existing session (%s)", user)
@@ -230,7 +255,7 @@ class UaProcessor:
         elif typeid == ua.NodeId(ua.ObjectIds.FindServersRequest_Encoding_DefaultBinary):
             _logger.info("find servers request (%s)", user)
             params = struct_from_binary(ua.FindServersParameters, body)
-            servers = self.iserver.find_servers(params)
+            servers = self.iserver.find_servers(params, sockname=self.sockname)
             response = ua.FindServersResponse()
             response.Servers = servers
             # _logger.info("sending find servers response")
@@ -259,7 +284,7 @@ class UaProcessor:
             self.send_response(requesthdr.RequestHandle, seqhdr, response)
             return False
         else:
-            # All services that requere a active session
+            # All services that require an active session
             if not self.session:
                 _logger.info("Request service that need a session (%s)", user)
                 raise ServiceError(ua.StatusCodes.BadSessionIdInvalid)
@@ -342,7 +367,9 @@ class UaProcessor:
             elif typeid == ua.NodeId(ua.ObjectIds.CreateSubscriptionRequest_Encoding_DefaultBinary):
                 _logger.info("create subscription request (%s)", user)
                 params = struct_from_binary(ua.CreateSubscriptionParameters, body)
-                result = await self.session.create_subscription(params, callback=self.forward_publish_response)
+                result = await self.session.create_subscription(
+                    params, self.forward_publish_response, request_callback=self.get_publish_request
+                )
                 response = ua.CreateSubscriptionResponse()
                 response.Parameters = result
                 # _logger.info("sending create subscription response")
@@ -352,12 +379,12 @@ class UaProcessor:
                 _logger.info("modify subscription request")
                 params = struct_from_binary(ua.ModifySubscriptionParameters, body)
 
-                result = self.session.modify_subscription(params, self.forward_publish_response)
+                result = self.session.modify_subscription(params)
 
                 response = ua.ModifySubscriptionResponse()
                 response.Parameters = result
 
-                #_logger.info("sending modify subscription response")
+                # _logger.info("sending modify subscription response")
                 self.send_response(requesthdr.RequestHandle, seqhdr, response)
 
             elif typeid == ua.NodeId(ua.ObjectIds.DeleteSubscriptionsRequest_Encoding_DefaultBinary):
@@ -426,19 +453,22 @@ class UaProcessor:
                 if not self.session:
                     return False
                 params = struct_from_binary(ua.PublishParameters, body)
-                data = PublishRequestData(requesthdr=requesthdr, seqhdr=seqhdr)
-                # Store the Publish Request (will be used to send publish answers from server)
-                self._publish_requests.append(data)
-                # If there is an enqueued result forward it immediately
-                while self._publish_results:
-                    result = self._publish_results.popleft()
-                    if result.SubscriptionId not in self.session.subscription_service.active_subscription_ids:
-                        # Discard the result if the subscription is no longer active
-                        continue
-                    await self.forward_publish_response(result)
-                    break
                 self.session.publish(params.SubscriptionAcknowledgements)
-                # _logger.debug("publish forward to server")
+                data = PublishRequestData(requesthdr=requesthdr, seqhdr=seqhdr)
+                # If there is an enqueued publish results callback, try to call it immediately
+                while self._publish_results_subs:
+                    subscription_id = next(iter(self._publish_results_subs))
+                    self._publish_results_subs.pop(subscription_id)
+                    sub = self.session.subscription_service.subscriptions.get(subscription_id)
+                    if sub is None:
+                        # subscription is no longer active
+                        continue
+                    if await sub.publish_results(data):
+                        # publish request has been consumed
+                        break
+                else:
+                    # Store the Publish Request (will be used to send publish answers from server)
+                    self._publish_requests.append(data)
 
             elif typeid == ua.NodeId(ua.ObjectIds.RepublishRequest_Encoding_DefaultBinary):
                 _logger.info("re-publish request (%s)", user)
@@ -496,5 +526,22 @@ class UaProcessor:
         everything we should
         """
         _logger.info("Cleanup client connection: %s", self.name)
-        if self.session:
-            await self.session.close_session(True)
+        self._closing = True
+        try:
+            if self._session_watchdog_task:
+                await self._session_watchdog_task
+        finally:
+            if self.session:
+                await self.session.close_session(True)
+
+    async def _session_watchdog_loop(self):
+        """
+        Checks if the session is alive
+        """
+        timeout = min(self.session.session_timeout / 2, self._watchdog_interval)
+        timeout_timedelta = timedelta(seconds=self.session.session_timeout)
+        while not self._closing:
+            await asyncio.sleep(timeout)
+            if (datetime.now(timezone.utc) - timeout_timedelta) > self.session_last_activity:
+                _logger.warning("Session timed out after %ss of inactivity", timeout_timedelta.total_seconds())
+                await self.close()

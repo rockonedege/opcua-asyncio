@@ -1,10 +1,10 @@
 import asyncio
 import logging
 import sys
-sys.path.insert(0, "..")
-from IPython import embed
 
-from asyncua import ua, uamethod, Server
+sys.path.insert(0, "..")
+
+from asyncua import Server
 
 
 async def main():

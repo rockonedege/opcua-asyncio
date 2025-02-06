@@ -1,21 +1,28 @@
 import asyncio
 import logging
-from typing import List, Union, Coroutine, Optional
-from urllib.parse import urlparse, unquote
+import socket
+import dataclasses
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Type, Union, cast, Callable, Coroutine
+from urllib.parse import urlparse, unquote, ParseResult
+from pathlib import Path
 
+import asyncua
 from asyncua import ua
 from .ua_client import UaClient
 from ..common.xmlimporter import XmlImporter
 from ..common.xmlexporter import XmlExporter
 from ..common.node import Node
 from ..common.manage_nodes import delete_nodes
-from ..common.subscription import Subscription
+from ..common.subscription import Subscription, SubscriptionHandler
 from ..common.shortcuts import Shortcuts
 from ..common.structures import load_type_definitions, load_enums
 from ..common.structures104 import load_data_type_definitions
-from ..common.utils import create_nonce
+from ..common.utils import create_nonce, ServiceError
 from ..common.ua_utils import value_to_datavalue, copy_dataclass_attr
 from ..crypto import uacrypto, security_policies
+from ..crypto.validator import CertificateValidatorMethod
 
 _logger = logging.getLogger(__name__)
 
@@ -30,8 +37,9 @@ class Client:
     which offers the raw OPC-UA services interface.
     """
 
-    _username = None
-    _password = None
+    _username: Optional[str] = None
+    _password: Optional[str] = None
+    strip_url_credentials: bool = True
 
     def __init__(self, url: str, timeout: float = 4, watchdog_intervall: float = 1.0):
         """
@@ -43,37 +51,37 @@ class Client:
             time. The timeout is specified in seconds.
         :param watchdog_intervall:
             The time between checking if the server is still alive. The timeout is specified in seconds.
+
         Some other client parameters can be changed by setting
         attributes on the constructed object:
         See the source code for the exhaustive list.
         """
-        self.server_url = urlparse(url)
+        self._server_url = urlparse(url)
         # take initial username and password from the url
-        userinfo, have_info, hostinfo = self.server_url.netloc.rpartition('@')
+        userinfo, have_info, _ = self._server_url.netloc.rpartition("@")
         if have_info:
-            username, have_password, password = userinfo.partition(':')
+            username, have_password, password = userinfo.partition(":")
             self._username = unquote(username)
             if have_password:
                 self._password = unquote(password)
-            # remove credentials from url, preventing them to be sent unencrypted in e.g. send_hello
-            self.server_url = self.server_url.__class__(self.server_url[0], hostinfo, *self.server_url[2:])
 
         self.name = "Pure Python Async. Client"
         self.description = self.name
         self.application_uri = "urn:freeopcua:client"
         self.product_uri = "urn:freeopcua.github.io:client"
-        self.security_policy = ua.SecurityPolicy()
+        self.security_policy = security_policies.SecurityPolicyNone()
         self.secure_channel_id = None
         self.secure_channel_timeout = 3600000  # 1 hour
         self.session_timeout = 3600000  # 1 hour
-        self._policy_ids = []
+        self.connection_lost_callback: Optional[Callable[[Exception], Coroutine[Any, Any, None]]] = None
+        self._policy_ids: List[ua.UserTokenPolicy] = []
         self.uaclient: UaClient = UaClient(timeout)
         self.uaclient.pre_request_hook = self.check_connection
-        self.user_certificate = None
-        self.user_private_key = None
+        self.user_certificate: Optional[x509.Certificate] = None
+        self.user_private_key: Optional[PrivateKeyTypes] = None
         self._server_nonce = None
         self._session_counter = 1
-        self.nodes = Shortcuts(self.uaclient)
+        self.nodes: Shortcuts = Shortcuts(self.uaclient)
         self.max_messagesize = 0  # No limits
         self.max_chunkcount = 0  # No limits
         self._renew_channel_task = None
@@ -81,6 +89,8 @@ class Client:
         self._locale = ["en"]
         self._watchdog_intervall = watchdog_intervall
         self._closing: bool = False
+        self.certificate_validator: Optional[CertificateValidatorMethod] = None
+        """hook to validate a certificate, raises a ServiceError when not valid"""
 
     async def __aenter__(self):
         await self.connect()
@@ -94,25 +104,46 @@ class Client:
 
     __repr__ = __str__
 
+    @property
+    def server_url(self) -> ParseResult:
+        """Return the server URL with stripped credentials
+
+        if self.strip_url_credentials is True.  Disabling this
+        is not recommended for security reasons.
+        """
+        url = self._server_url
+        userinfo, have_info, hostinfo = url.netloc.rpartition("@")
+        if have_info:
+            # remove credentials from url, preventing them to be sent unencrypted in e.g. send_hello
+            if self.strip_url_credentials:
+                url = url.__class__(url[0], hostinfo, *url[2:])
+        return url
+
     @staticmethod
-    def find_endpoint(endpoints, security_mode, policy_uri):
+    def find_endpoint(
+        endpoints: Iterable[ua.EndpointDescription], security_mode: ua.MessageSecurityMode, policy_uri: str
+    ) -> ua.EndpointDescription:
         """
         Find endpoint with required security mode and policy URI
         """
         _logger.info("find_endpoint %r %r %r", endpoints, security_mode, policy_uri)
         for ep in endpoints:
-            if (ep.EndpointUrl.startswith(ua.OPC_TCP_SCHEME) and ep.SecurityMode == security_mode and ep.SecurityPolicyUri == policy_uri):
+            if (
+                ep.EndpointUrl.startswith(ua.OPC_TCP_SCHEME)
+                and ep.SecurityMode == security_mode
+                and ep.SecurityPolicyUri == policy_uri
+            ):
                 return ep
         raise ua.UaError(f"No matching endpoints: {security_mode}, {policy_uri}")
 
-    def set_user(self, username: str):
+    def set_user(self, username: str) -> None:
         """
         Set user name for the connection.
         initial user from the URL will be overwritten
         """
         self._username = username
 
-    def set_password(self, pwd: str):
+    def set_password(self, pwd: str) -> None:
         """
         Set user password for the connection.
         initial password from the URL will be overwritten
@@ -121,22 +152,22 @@ class Client:
             raise TypeError(f"Password must be a string, got {pwd} of type {type(pwd)}")
         self._password = pwd
 
-    def set_locale(self, locale: List[str]) -> None:
+    def set_locale(self, locale: Sequence[str]) -> None:
         """
-        Sets the prefred locales of the client, the server chooses which locale he can provide.
-        Normaly the first matching locale in the list will be chossen, by the server.
+        Sets the preferred locales of the client, the server chooses which locale he can provide.
+        Normally the first matching locale in the list will be chosen, by the server.
         Call this before connect()
         """
         self._locale = locale
 
-    async def set_security_string(self, string: str):
+    async def set_security_string(self, string: str) -> None:
         """
         Set SecureConnection mode.
-        :param string: Mode format ``Policy,Mode,certificate,private_key[,server_private_key]``
+        :param string: Mode format ``Policy,Mode,certificate,private_key[,server_certificate]``
         where:
-        - ``Policy`` is ``Basic128Rsa15``, ``Basic256`` or ``Basic256Sha256``
+        - ``Policy`` is ``Basic256Sha256``, ``Aes128Sha256RsaOaep`` or ``Aes256Sha256RsaPss``
         - ``Mode`` is ``Sign`` or ``SignAndEncrypt``
-        - ``certificate`` and ``server_private_key`` are paths to ``.pem`` or ``.der`` files
+        - ``certificate`` and ``server_certificate`` are paths to ``.pem`` or ``.der`` files
         - ``private_key`` may be a path to a ``.pem`` or ``.der`` file or a conjunction of ``path``::``password`` where
           ``password`` is the private key password.
         Call this before connect()
@@ -147,37 +178,45 @@ class Client:
         if len(parts) < 4:
             raise ua.UaError(f"Wrong format: `{string}`, expected at least 4 comma-separated values")
 
-        if '::' in parts[3]:  # if the filename contains a colon, assume it's a conjunction and parse it
-            parts[3], client_key_password = parts[3].split('::')
+        if "::" in parts[3]:  # if the filename contains a colon, assume it's a conjunction and parse it
+            parts[3], client_key_password = parts[3].split("::")
         else:
             client_key_password = None
 
         policy_class = getattr(security_policies, f"SecurityPolicy{parts[0]}")
         mode = getattr(ua.MessageSecurityMode, parts[1])
-        return await self.set_security(policy_class, parts[2], parts[3], client_key_password, parts[4] if len(parts) >= 5 else None, mode)
+        return await self.set_security(
+            policy_class, parts[2], parts[3], client_key_password, parts[4] if len(parts) >= 5 else None, mode
+        )
 
     async def set_security(
         self,
-        policy: ua.SecurityPolicy,
-        certificate: Union[str, uacrypto.CertProperties],
-        private_key: Union[str, uacrypto.CertProperties],
+        policy: Type[security_policies.SecurityPolicy],
+        certificate: Union[str, uacrypto.CertProperties, bytes, Path],
+        private_key: Union[str, uacrypto.CertProperties, bytes, Path],
         private_key_password: Optional[Union[str, bytes]] = None,
-        server_certificate: Optional[Union[str, uacrypto.CertProperties]] = None,
+        server_certificate: Optional[Union[str, uacrypto.CertProperties, bytes]] = None,
         mode: ua.MessageSecurityMode = ua.MessageSecurityMode.SignAndEncrypt,
-    ):
+    ) -> None:
         """
         Set SecureConnection mode.
         Call this before connect()
         """
         if server_certificate is None:
             # Force unencrypted/unsigned SecureChannel to list the endpoints
-            new_policy = ua.SecurityPolicy()
+            new_policy = security_policies.SecurityPolicyNone()
             self.security_policy = new_policy
             self.uaclient.security_policy = new_policy
             # load certificate from server's list of endpoints
             endpoints = await self.connect_and_get_server_endpoints()
             endpoint = Client.find_endpoint(endpoints, mode, policy.URI)
-            server_certificate = uacrypto.x509_from_der(endpoint.ServerCertificate)
+            # If a server has certificate chain, the certificates are chained
+            # this generates a error in our crypto part, so we strip everything after
+            # the server cert. To do this we read byte 2:4 and get the length - 4
+            cert_len_idx = 2
+            len_bytestr = endpoint.ServerCertificate[cert_len_idx : cert_len_idx + 2]
+            cert_len = int.from_bytes(len_bytestr, byteorder="big", signed=False) + 4
+            server_certificate = uacrypto.x509_from_der(endpoint.ServerCertificate[:cert_len])
         elif not isinstance(server_certificate, uacrypto.CertProperties):
             server_certificate = uacrypto.CertProperties(server_certificate)
         if not isinstance(certificate, uacrypto.CertProperties):
@@ -188,37 +227,39 @@ class Client:
 
     async def _set_security(
         self,
-        policy: ua.SecurityPolicy,
+        policy: Type[security_policies.SecurityPolicy],
         certificate: uacrypto.CertProperties,
         private_key: uacrypto.CertProperties,
         server_cert: uacrypto.CertProperties,
         mode: ua.MessageSecurityMode = ua.MessageSecurityMode.SignAndEncrypt,
-    ):
-
+    ) -> None:
         if isinstance(server_cert, uacrypto.CertProperties):
-            server_cert = await uacrypto.load_certificate(server_cert.path, server_cert.extension)
-        cert = await uacrypto.load_certificate(certificate.path, certificate.extension)
+            server_cert = await uacrypto.load_certificate(server_cert.path_or_content, server_cert.extension)
+        cert = await uacrypto.load_certificate(certificate.path_or_content, certificate.extension)
         pk = await uacrypto.load_private_key(
-            private_key.path,
+            private_key.path_or_content,
             private_key.password,
             private_key.extension,
         )
+        uacrypto.check_certificate(cert, self.application_uri, socket.gethostname())
         self.security_policy = policy(server_cert, cert, pk, mode)  # type: ignore
         self.uaclient.set_security(self.security_policy)
 
-    async def load_client_certificate(self, path: str, extension: Optional[str] = None):
+    async def load_client_certificate(self, path: str, extension: Optional[str] = None) -> None:
         """
         load our certificate from file, either pem or der
         """
         self.user_certificate = await uacrypto.load_certificate(path, extension)
 
-    async def load_private_key(self, path: str, password: Optional[Union[str, bytes]] = None, extension: Optional[str] = None):
+    async def load_private_key(
+        self, path: Path, password: Optional[Union[str, bytes]] = None, extension: Optional[str] = None
+    ) -> None:
         """
         Load user private key. This is used for authenticating using certificate
         """
         self.user_private_key = await uacrypto.load_private_key(path, password, extension)
 
-    async def connect_and_get_server_endpoints(self):
+    async def connect_and_get_server_endpoints(self) -> List[ua.EndpointDescription]:
         """
         Connect, ask server for endpoints, and disconnect
         """
@@ -234,7 +275,7 @@ class Client:
             self.disconnect_socket()
         return endpoints
 
-    async def connect_and_find_servers(self):
+    async def connect_and_find_servers(self) -> List[ua.ApplicationDescription]:
         """
         Connect, ask server for a list of known servers, and disconnect
         """
@@ -250,7 +291,7 @@ class Client:
             self.disconnect_socket()
         return servers
 
-    async def connect_and_find_servers_on_network(self):
+    async def connect_and_find_servers_on_network(self) -> List[ua.FindServersOnNetworkResult]:
         """
         Connect, ask server for a list of known servers on network, and disconnect
         """
@@ -266,7 +307,7 @@ class Client:
             self.disconnect_socket()
         return servers
 
-    async def connect(self):
+    async def connect(self) -> None:
         """
         High level method
         Connect, create and activate session
@@ -279,7 +320,9 @@ class Client:
             try:
                 await self.create_session()
                 try:
-                    await self.activate_session(username=self._username, password=self._password, certificate=self.user_certificate)
+                    await self.activate_session(
+                        username=self._username, password=self._password, certificate=self.user_certificate
+                    )
                 except Exception:
                     # clean up session
                     await self.close_session()
@@ -293,7 +336,22 @@ class Client:
             self.disconnect_socket()
             raise
 
-    async def disconnect(self):
+    async def connect_sessionless(self) -> None:
+        """
+        High level method
+        Connect without a session
+        """
+        _logger.info("connect")
+        await self.connect_socket()
+        try:
+            await self.send_hello()
+            await self.open_secure_channel()
+        except Exception:
+            # clean up open socket
+            self.disconnect_socket()
+            raise
+
+    async def disconnect(self) -> None:
         """
         High level method
         Close session, secure channel and socket
@@ -305,17 +363,29 @@ class Client:
         finally:
             self.disconnect_socket()
 
-    async def connect_socket(self):
+    async def disconnect_sessionless(self) -> None:
+        """
+        High level method
+        Close secure channel and socket
+        """
+        _logger.info("disconnect")
+        try:
+            await self.close_secure_channel()
+        finally:
+            self.disconnect_socket()
+
+    async def connect_socket(self) -> None:
         """
         connect to socket defined in url
         """
+
         await self.uaclient.connect_socket(self.server_url.hostname, self.server_url.port)
 
-    def disconnect_socket(self):
+    def disconnect_socket(self) -> None:
         if self.uaclient:
             self.uaclient.disconnect_socket()
 
-    async def send_hello(self):
+    async def send_hello(self) -> None:
         """
         Send OPC-UA hello to server
         """
@@ -323,7 +393,7 @@ class Client:
         if isinstance(ack, ua.UaStatusCodeError):
             raise ack
 
-    async def open_secure_channel(self, renew=False):
+    async def open_secure_channel(self, renew: bool = False) -> None:
         """
         Open secure channel, if renew is True, renew channel
         """
@@ -338,20 +408,26 @@ class Client:
         params.ClientNonce = create_nonce(self.security_policy.secure_channel_nonce_length)
         result = await self.uaclient.open_secure_channel(params)
         if self.secure_channel_timeout != result.SecurityToken.RevisedLifetime:
-            _logger.info("Requested secure channel timeout to be %dms, got %dms instead", self.secure_channel_timeout, result.SecurityToken.RevisedLifetime)
+            _logger.info(
+                "Requested secure channel timeout to be %dms, got %dms instead",
+                self.secure_channel_timeout,
+                result.SecurityToken.RevisedLifetime,
+            )
             self.secure_channel_timeout = result.SecurityToken.RevisedLifetime
 
     async def close_secure_channel(self):
         return await self.uaclient.close_secure_channel()
 
-    async def get_endpoints(self) -> list:
+    async def get_endpoints(self) -> List[ua.EndpointDescription]:
         """Get a list of OPC-UA endpoints."""
 
         params = ua.GetEndpointsParameters()
         params.EndpointUrl = self.server_url.geturl()
         return await self.uaclient.get_endpoints(params)
 
-    async def register_server(self, server, discovery_configuration=None):
+    async def register_server(
+        self, server: "asyncua.server.Server", discovery_configuration: Optional[ua.DiscoveryConfiguration] = None
+    ) -> None:
         """
         register a server to discovery server
         if discovery_configuration is provided, the newer register_server2 service call is used
@@ -359,7 +435,7 @@ class Client:
         serv = ua.RegisteredServer()
         serv.ServerUri = server.get_application_uri()
         serv.ProductUri = server.product_uri
-        serv.DiscoveryUrls = [server.endpoint.geturl()]
+        serv.DiscoveryUrls = [cast(ua.String, server.endpoint.geturl())]
         serv.ServerType = server.application_type
         serv.ServerNames = [ua.LocalizedText(server.name)]
         serv.IsOnline = True
@@ -370,7 +446,28 @@ class Client:
             return await self.uaclient.register_server2(params)
         return await self.uaclient.register_server(serv)
 
-    async def find_servers(self, uris=None):
+    async def unregister_server(
+        self, server: "asyncua.server.Server", discovery_configuration: Optional[ua.DiscoveryConfiguration] = None
+    ) -> None:
+        """
+        register a server to discovery server
+        if discovery_configuration is provided, the newer register_server2 service call is used
+        """
+        serv = ua.RegisteredServer()
+        serv.ServerUri = server.get_application_uri()
+        serv.ProductUri = server.product_uri
+        serv.DiscoveryUrls = [cast(ua.String, server.endpoint.geturl())]
+        serv.ServerType = server.application_type
+        serv.ServerNames = [ua.LocalizedText(server.name)]
+        serv.IsOnline = False
+        if discovery_configuration:
+            params = ua.RegisterServer2Parameters()
+            params.Server = serv
+            params.DiscoveryConfiguration = discovery_configuration
+            return await self.uaclient.unregister_server2(params)
+        return await self.uaclient.unregister_server(serv)
+
+    async def find_servers(self, uris: Optional[Iterable[str]] = None) -> List[ua.ApplicationDescription]:
         """
         send a FindServer request to the server. The answer should be a list of
         servers the server knows about
@@ -380,17 +477,17 @@ class Client:
             uris = []
         params = ua.FindServersParameters()
         params.EndpointUrl = self.server_url.geturl()
-        params.ServerUris = uris
+        params.ServerUris = list(uris)
         return await self.uaclient.find_servers(params)
 
-    async def find_servers_on_network(self):
+    async def find_servers_on_network(self) -> List[ua.FindServersOnNetworkResult]:
         params = ua.FindServersOnNetworkParameters()
         return await self.uaclient.find_servers_on_network(params)
 
-    async def create_session(self):
+    async def create_session(self) -> ua.CreateSessionResult:
         """
         send a CreateSessionRequest to server with reasonable parameters.
-        If you want o modify settings look at code of this methods
+        If you want to modify settings look at code of these methods
         and make your own
         """
         self._closing = False
@@ -417,22 +514,44 @@ class Client:
             data = self.security_policy.host_certificate + nonce
         self.security_policy.asymmetric_cryptography.verify(data, response.ServerSignature.Signature)
         self._server_nonce = response.ServerNonce
+        server_certificate = None
+        if response.ServerCertificate is not None:
+            # If a server has certificate chain, the certificates are chained
+            # this generates a error in our crypto part, so we strip everything after
+            # the server cert. To do this we read byte 2:4 and get the length - 4
+            cert_len_idx = 2
+            len_bytestr = response.ServerCertificate[cert_len_idx : cert_len_idx + 2]
+            cert_len = int.from_bytes(len_bytestr, byteorder="big", signed=False) + 4
+            server_certificate = response.ServerCertificate[:cert_len]
         if not self.security_policy.peer_certificate:
-            self.security_policy.peer_certificate = response.ServerCertificate
-        elif self.security_policy.peer_certificate != response.ServerCertificate:
+            self.security_policy.peer_certificate = server_certificate
+        elif self.security_policy.peer_certificate != server_certificate:
             raise ua.UaError("Server certificate mismatch")
         # remember PolicyId's: we will use them in activate_session()
         ep = Client.find_endpoint(response.ServerEndpoints, self.security_policy.Mode, self.security_policy.URI)
+
+        if self.certificate_validator and server_certificate:
+            try:
+                await self.certificate_validator(x509.load_der_x509_certificate(server_certificate), ep.Server)
+            except ServiceError as exp:
+                status = ua.StatusCode(exp.code)
+                _logger.error("create_session fault response: %s (%s)", status.doc, status.name)
+                raise ua.UaStatusCodeError(exp.code) from exp
+
         self._policy_ids = ep.UserIdentityTokens
         #  Actual maximum number of milliseconds that a Session shall remain open without activity
         if self.session_timeout != response.RevisedSessionTimeout:
-            _logger.warning("Requested session timeout to be %dms, got %dms instead", self.secure_channel_timeout, response.RevisedSessionTimeout)
+            _logger.warning(
+                "Requested session timeout to be %dms, got %dms instead",
+                self.secure_channel_timeout,
+                response.RevisedSessionTimeout,
+            )
             self.session_timeout = response.RevisedSessionTimeout
         self._renew_channel_task = asyncio.create_task(self._renew_channel_loop())
         self._monitor_server_task = asyncio.create_task(self._monitor_server_loop())
         return response
 
-    async def check_connection(self):
+    async def check_connection(self) -> None:
         # can be used to check if the client is still connected
         # if not it throws the underlying exception
         if self._renew_channel_task is not None:
@@ -457,18 +576,28 @@ class Client:
                 _ = await self.nodes.server_state.read_value()
         except ConnectionError as e:
             _logger.info("connection error in watchdog loop %s", e, exc_info=True)
-            await self.uaclient.inform_subscriptions(ua.StatusCodes.BadShutdown)
+            await self._lost_connection(e)
+            await self.uaclient.inform_subscriptions(ua.StatusCode(ua.StatusCodes.BadShutdown))
             raise
-        except Exception:
+        except Exception as e:
             _logger.exception("Error in watchdog loop")
-            await self.uaclient.inform_subscriptions(ua.StatusCodes.BadShutdown)
+            await self._lost_connection(e)
+            await self.uaclient.inform_subscriptions(ua.StatusCode(ua.StatusCodes.BadShutdown))
             raise
+
+    async def _lost_connection(self, ex: Exception):
+        if not self.connection_lost_callback:
+            return
+        try:
+            await self.connection_lost_callback(ex)
+        except Exception as ex:
+            _logger.exception("Error calling connection_lost_callbak")
 
     async def _renew_channel_loop(self):
         """
         Renew the SecureChannel before the SecureChannelTimeout will happen.
-        In theory we could do that only if no session activity
-        but it does not cost much..
+        In theory, we could do that only if no session activity,
+        but it does not cost much.
         """
         try:
             # Part4 5.5.2.1:
@@ -487,31 +616,26 @@ class Client:
             _logger.exception("Error while renewing session")
             raise
 
-    def server_policy_id(self, token_type, default):
+    def server_policy(self, token_type: ua.UserTokenType) -> ua.UserTokenPolicy:
         """
-        Find PolicyId of server's UserTokenPolicy by token_type.
-        Return default if there's no matching UserTokenPolicy.
-        """
-        for policy in self._policy_ids:
-            if policy.TokenType == token_type:
-                return policy.PolicyId
-        return default
-
-    def server_policy_uri(self, token_type):
-        """
-        Find SecurityPolicyUri of server's UserTokenPolicy by token_type.
+        Find UserTokenPolicy by token_type.
         If SecurityPolicyUri is empty, use default SecurityPolicyUri
         of the endpoint
         """
         for policy in self._policy_ids:
             if policy.TokenType == token_type:
                 if policy.SecurityPolicyUri:
-                    return policy.SecurityPolicyUri
+                    return policy
                 # empty URI means "use this endpoint's policy URI"
-                return self.security_policy.URI
-        return self.security_policy.URI
+                return dataclasses.replace(policy, SecurityPolicyUri=self.security_policy.URI)
+        return ua.UserTokenPolicy(TokenType=token_type, SecurityPolicyUri=self.security_policy.URI)
 
-    async def activate_session(self, username: str = None, password: str = None, certificate=None):
+    async def activate_session(
+        self,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        certificate: Optional[x509.Certificate] = None,
+    ) -> ua.ActivateSessionResult:
         """
         Activate session using either username and password or private_key
         """
@@ -525,7 +649,7 @@ class Client:
         if self.security_policy.AsymmetricSignatureURI:
             params.ClientSignature.Algorithm = self.security_policy.AsymmetricSignatureURI
         else:
-            params.ClientSignature.Algorithm = (security_policies.SecurityPolicyBasic256.AsymmetricSignatureURI)
+            params.ClientSignature.Algorithm = security_policies.SecurityPolicyBasic256.AsymmetricSignatureURI
         params.ClientSignature.Signature = self.security_policy.asymmetric_cryptography.signature(challenge)
         params.LocaleIds = self._locale
         if not username and not user_certificate:
@@ -534,49 +658,45 @@ class Client:
             self._add_certificate_auth(params, user_certificate, challenge)
         else:
             self._add_user_auth(params, username, password)
-        return await self.uaclient.activate_session(params)
+        res = await self.uaclient.activate_session(params)
+        self._server_nonce = res.ServerNonce
+        return res
 
     def _add_anonymous_auth(self, params):
         params.UserIdentityToken = ua.AnonymousIdentityToken()
-        params.UserIdentityToken.PolicyId = self.server_policy_id(ua.UserTokenType.Anonymous, "anonymous")
+        params.UserIdentityToken.PolicyId = self.server_policy(ua.UserTokenType.Anonymous).PolicyId
 
     def _add_certificate_auth(self, params, certificate, challenge):
         params.UserIdentityToken = ua.X509IdentityToken()
         params.UserIdentityToken.CertificateData = uacrypto.der_from_x509(certificate)
         # specs part 4, 5.6.3.1: the data to sign is created by appending
         # the last serverNonce to the serverCertificate
-        params.UserTokenSignature = ua.SignatureData()
-        # use signature algorithm that was used for certificate generation
-        if certificate.signature_hash_algorithm.name == "sha256":
-            params.UserIdentityToken.PolicyId = self.server_policy_id(ua.UserTokenType.Certificate, "certificate_basic256sha256")
-            sig = uacrypto.sign_sha256(self.user_private_key, challenge)
-            params.UserTokenSignature.Algorithm = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
-            params.UserTokenSignature.Signature = sig
-        else:
-            params.UserIdentityToken.PolicyId = self.server_policy_id(ua.UserTokenType.Certificate, "certificate_basic256")
-            sig = uacrypto.sign_sha1(self.user_private_key, challenge)
-            params.UserTokenSignature.Algorithm = "http://www.w3.org/2000/09/xmldsig#rsa-sha1"
-            params.UserTokenSignature.Signature = sig
+        policy = self.server_policy(ua.UserTokenType.Certificate)
+        sig, alg = security_policies.sign_asymmetric(self.user_private_key, challenge, policy.SecurityPolicyUri)
+        params.UserIdentityToken.PolicyId = policy.PolicyId
+        params.UserTokenSignature.Algorithm = alg
+        params.UserTokenSignature.Signature = sig
 
     def _add_user_auth(self, params, username: str, password: str):
         params.UserIdentityToken = ua.UserNameIdentityToken()
         params.UserIdentityToken.UserName = username
-        policy_uri = self.server_policy_uri(ua.UserTokenType.UserName)
-        if not policy_uri or policy_uri == security_policies.POLICY_NONE_URI:
+        policy = self.server_policy(ua.UserTokenType.UserName)
+        if not policy.SecurityPolicyUri or policy.SecurityPolicyUri == security_policies.SecurityPolicyNone.URI:
             # see specs part 4, 7.36.3: if the token is NOT encrypted,
             # then the password only contains UTF-8 encoded password
             # and EncryptionAlgorithm is null
-            if self._password:
-                _logger.warning("Sending plain-text password")
+            if password:
+                if self.security_policy.Mode != ua.MessageSecurityMode.SignAndEncrypt:
+                    _logger.warning("Sending plain-text password")
                 params.UserIdentityToken.Password = password.encode("utf8")
             params.UserIdentityToken.EncryptionAlgorithm = None
-        elif self._password:
-            data, uri = self._encrypt_password(password, policy_uri)
+        elif password:
+            data, uri = self._encrypt_password(password, policy.SecurityPolicyUri)
             params.UserIdentityToken.Password = data
             params.UserIdentityToken.EncryptionAlgorithm = uri
-        params.UserIdentityToken.PolicyId = self.server_policy_id(ua.UserTokenType.UserName, "username_basic256")
+        params.UserIdentityToken.PolicyId = policy.PolicyId
 
-    def _encrypt_password(self, password: str, policy_uri):
+    def _encrypt_password(self, password: str, policy_uri) -> Tuple[bytes, str]:
         pubkey = uacrypto.x509_from_der(self.security_policy.peer_certificate).public_key()
         # see specs part 4, 7.36.3: if the token is encrypted, password
         # shall be converted to UTF-8 and serialized with server nonce
@@ -587,7 +707,7 @@ class Client:
         data, uri = security_policies.encrypt_asymmetric(pubkey, etoken, policy_uri)
         return data, uri
 
-    async def close_session(self):
+    async def close_session(self) -> None:
         """
         Close session
         """
@@ -596,40 +716,39 @@ class Client:
             self._monitor_server_task.cancel()
             try:
                 await self._monitor_server_task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, Exception):
                 pass
-            except Exception:
-                _logger.exception("Error while closing watch_task")
         # disable hook because we kill our monitor task, so we are going to get CancelledError at every request
         self.uaclient.pre_request_hook = None
         if self._renew_channel_task:
             self._renew_channel_task.cancel()
             try:
                 await self._renew_channel_task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, Exception):
                 pass
-            except Exception:
-                _logger.exception("Error while closing secure channel loop")
         return await self.uaclient.close_session(True)
 
-    def get_root_node(self):
+    def get_root_node(self) -> Node:
         return self.get_node(ua.TwoByteNodeId(ua.ObjectIds.RootFolder))
 
-    def get_objects_node(self):
+    def get_objects_node(self) -> Node:
         _logger.info("get_objects_node")
         return self.get_node(ua.TwoByteNodeId(ua.ObjectIds.ObjectsFolder))
 
-    def get_server_node(self):
+    def get_server_node(self) -> Node:
         return self.get_node(ua.FourByteNodeId(ua.ObjectIds.Server))
 
-    def get_node(self, nodeid: Union[ua.NodeId, str]) -> Node:
+    def get_node(self, nodeid: Union[Node, ua.NodeId, str, int]) -> Node:
         """
         Get node using NodeId object or a string representing a NodeId.
         """
         return Node(self.uaclient, nodeid)
 
     async def create_subscription(
-        self, period, handler, publishing=True
+        self,
+        period: Union[ua.CreateSubscriptionParameters, float],
+        handler: SubscriptionHandler,
+        publishing: bool = True,
     ) -> Subscription:
         """
         Create a subscription.
@@ -654,10 +773,10 @@ class Client:
         new_params = self.get_subscription_revised_params(params, results)
         if new_params:
             results = await subscription.update(new_params)
-            _logger.info(f"Result from subscription update: {results}")
+            _logger.info("Result from subscription update: %s", results)
         return subscription
 
-    def get_subscription_revised_params(  # type: ignore
+    def get_subscription_revised_params(
         self,
         params: ua.CreateSubscriptionParameters,
         results: ua.CreateSubscriptionResult,
@@ -667,10 +786,8 @@ class Client:
             and results.RevisedLifetimeCount == params.RequestedLifetimeCount
             and results.RevisedMaxKeepAliveCount == params.RequestedMaxKeepAliveCount
         ):
-            return  # type: ignore
-        _logger.warning(
-            f"Revised values returned differ from subscription values: {results}"
-        )
+            return None
+        _logger.warning("Revised values returned differ from subscription values: %s", results)
         revised_interval = results.RevisedPublishingInterval
         # Adjust the MaxKeepAliveCount based on the RevisedPublishInterval when necessary
         new_keepalive_count = self.get_keepalive_count(revised_interval)
@@ -679,8 +796,8 @@ class Client:
             and new_keepalive_count != params.RequestedMaxKeepAliveCount
         ):
             _logger.info(
-                f"KeepAliveCount will be updated to {new_keepalive_count} "
-                f"for consistency with RevisedPublishInterval"
+                "KeepAliveCount will be updated to %s for consistency with RevisedPublishInterval",
+                new_keepalive_count,
             )
             modified_params = ua.ModifySubscriptionParameters()
             # copy the existing subscription parameters
@@ -688,14 +805,19 @@ class Client:
             # then override with the revised values
             modified_params.RequestedMaxKeepAliveCount = new_keepalive_count
             modified_params.SubscriptionId = results.SubscriptionId
-            modified_params.RequestedPublishingInterval = (
-                results.RevisedPublishingInterval
-            )
+            modified_params.RequestedPublishingInterval = results.RevisedPublishingInterval
             # update LifetimeCount but chances are it will be re-revised again
             modified_params.RequestedLifetimeCount = results.RevisedLifetimeCount
             return modified_params
+        return None
 
-    def get_keepalive_count(self, period) -> int:
+    async def delete_subscriptions(self, subscription_ids: Iterable[int]) -> List[ua.StatusCode]:
+        """
+        Deletes the provided list of subscription_ids
+        """
+        return await self.uaclient.delete_subscriptions(subscription_ids)
+
+    def get_keepalive_count(self, period: float) -> int:
         """
         We request the server to send a Keepalive notification when
         no notification has been received for 75% of the session lifetime.
@@ -708,26 +830,28 @@ class Client:
         period = period or 1000
         return int((self.session_timeout / period) * 0.75)
 
-    async def get_namespace_array(self):
+    async def get_namespace_array(self) -> List[str]:
         ns_node = self.get_node(ua.NodeId(ua.ObjectIds.Server_NamespaceArray))
         return await ns_node.read_value()
 
-    async def get_namespace_index(self, uri):
+    async def get_namespace_index(self, uri: str) -> int:
         uries = await self.get_namespace_array()
         _logger.info("get_namespace_index %s %r", type(uries), uries)
         return uries.index(uri)
 
-    async def delete_nodes(self, nodes, recursive=False) -> Coroutine:
+    async def delete_nodes(self, nodes: Iterable[Node], recursive=False) -> Tuple[List[Node], List[ua.StatusCode]]:
         return await delete_nodes(self.uaclient, nodes, recursive)
 
-    async def import_xml(self, path=None, xmlstring=None, strict_mode=True) -> Coroutine:
+    async def import_xml(
+        self, path=None, xmlstring=None, strict_mode=True, auto_load_definitions: bool = True
+    ) -> List[ua.NodeId]:
         """
         Import nodes defined in xml
         """
-        importer = XmlImporter(self, strict_mode=strict_mode)
+        importer = XmlImporter(self, strict_mode=strict_mode, auto_load_definitions=auto_load_definitions)
         return await importer.import_xml(path, xmlstring)
 
-    async def export_xml(self, nodes, path, export_values: bool = False):
+    async def export_xml(self, nodes, path, export_values: bool = False) -> None:
         """
         Export defined nodes to xml
         :param export_values: exports values from variants
@@ -736,7 +860,7 @@ class Client:
         await exp.build_etree(nodes)
         await exp.write_xml(path)
 
-    async def register_namespace(self, uri):
+    async def register_namespace(self, uri: str) -> int:
         """
         Register a new namespace. Nodes should in custom namespace, not 0.
         This method is mainly implemented for symmetry with server
@@ -759,7 +883,9 @@ class Client:
         _logger.warning("Deprecated since spec 1.04, call load_data_type_definitions")
         return await load_type_definitions(self, nodes)
 
-    async def load_data_type_definitions(self, node=None, overwrite_existing=False):
+    async def load_data_type_definitions(
+        self, node: Optional[Node] = None, overwrite_existing: bool = False
+    ) -> Dict[str, Type]:
         """
         Load custom types (custom structures/extension objects) definition from server
         Generate Python classes for custom structures/extension objects defined in server
@@ -767,7 +893,7 @@ class Client:
         """
         return await load_data_type_definitions(self, node, overwrite_existing=overwrite_existing)
 
-    async def load_enums(self):
+    async def load_enums(self) -> Dict[str, Type]:
         """
         generate Python enums for custom enums on server.
         This enums will be available in ua module
@@ -775,7 +901,7 @@ class Client:
         _logger.warning("Deprecated since spec 1.04, call load_data_type_definitions")
         return await load_enums(self)
 
-    async def register_nodes(self, nodes):
+    async def register_nodes(self, nodes: Iterable[Node]) -> List[Node]:
         """
         Register nodes for faster read and write access (if supported by server)
         Rmw: This call modifies the nodeid of the nodes, the original nodeid is
@@ -786,9 +912,9 @@ class Client:
         for node, nodeid in zip(nodes, nodeids):
             node.basenodeid = node.nodeid
             node.nodeid = nodeid
-        return nodes
+        return list(nodes)
 
-    async def unregister_nodes(self, nodes):
+    async def unregister_nodes(self, nodes: Iterable[Node]) -> None:
         """
         Unregister nodes
         """
@@ -800,28 +926,40 @@ class Client:
             node.nodeid = node.basenodeid
             node.basenodeid = None
 
-    async def read_values(self, nodes):
+    async def read_attributes(
+        self, nodes: Iterable[Node], attr: ua.AttributeIds = ua.AttributeIds.Value
+    ) -> List[ua.DataValue]:
+        """
+        Read the attributes of multiple nodes.
+        """
+        nodeids = [node.nodeid for node in nodes]
+        return await self.uaclient.read_attributes(nodeids, attr)
+
+    async def read_values(self, nodes: Iterable[Node]) -> List[Any]:
         """
         Read the value of multiple nodes in one ua call.
         """
-        nodeids = [node.nodeid for node in nodes]
-        results = await self.uaclient.read_attributes(nodeids, ua.AttributeIds.Value)
-        return [result.Value.Value for result in results]
+        res = await self.read_attributes(nodes, attr=ua.AttributeIds.Value)
+        return [r.Value.Value if r.Value else None for r in res]
 
-    async def write_values(self, nodes, values):
+    async def write_values(
+        self, nodes: Iterable[Node], values: Iterable[Any], raise_on_partial_error: bool = True
+    ) -> List[ua.StatusCode]:
         """
         Write values to multiple nodes in one ua call
         """
         nodeids = [node.nodeid for node in nodes]
         dvs = [value_to_datavalue(val) for val in values]
         results = await self.uaclient.write_attributes(nodeids, dvs, ua.AttributeIds.Value)
-        for result in results:
-            result.check()
+        if raise_on_partial_error:
+            for result in results:
+                result.check()
+        return results
 
     get_values = read_values  # legacy compatibility
     set_values = write_values  # legacy compatibility
 
-    async def browse_nodes(self, nodes):
+    async def browse_nodes(self, nodes: Iterable[Node]) -> List[Tuple[Node, ua.BrowseResult]]:
         """
         Browses multiple nodes in one ua call
         returns a List of Tuples(Node, BrowseResult)
@@ -838,3 +976,19 @@ class Client:
         parameters.NodesToBrowse = nodestobrowse
         results = await self.uaclient.browse(parameters)
         return list(zip(nodes, results))
+
+    async def translate_browsepaths(
+        self, starting_node: ua.NodeId, relative_paths: Iterable[Union[ua.RelativePath, str]]
+    ) -> List[ua.BrowsePathResult]:
+        bpaths = []
+        for p in relative_paths:
+            try:
+                rpath = ua.RelativePath.from_string(p) if isinstance(p, str) else p
+            except ValueError as e:
+                raise ua.UaStringParsingError(f"Failed to parse one of RelativePath: {p}") from e
+            bpath = ua.BrowsePath()
+            bpath.StartingNode = starting_node
+            bpath.RelativePath = rpath
+            bpaths.append(bpath)
+
+        return await self.uaclient.translate_browsepaths_to_nodeids(bpaths)

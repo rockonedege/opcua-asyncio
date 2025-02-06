@@ -6,8 +6,9 @@ for custom structures
 
 import uuid
 import logging
+
 # The next two imports are for generated code
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import IntEnum, EnumMeta
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -21,7 +22,7 @@ from .structures104 import get_default_value, clean_name
 _logger = logging.getLogger(__name__)
 
 
-class EnumType(object):
+class EnumType:
     def __init__(self, name):
         self.name = clean_name(name)
         self.fields = []
@@ -88,22 +89,28 @@ class {self.name}:
             field.uatype = "UInt32"
             self.fields = [field] + self.fields
         for sfield in self.fields:
-            uatype = f"'ua.{sfield.uatype}'"
-            if sfield.array:
-                uatype = f"List[{uatype}]"
-            if uatype == 'List[ua.Char]':
-                uatype = 'String'
-            if sfield.is_optional:
-                code += f"    {sfield.name}: Optional[{uatype}] = None\n"
-            else:
-                uavalue = sfield.value
-                if isinstance(uavalue, str) and uavalue.startswith("ua."):
-                    uavalue = f"field(default_factory=lambda: {uavalue})"
-                code += f"    {sfield.name}:{uatype} = {uavalue}\n"
+            if sfield.name != "SwitchField":
+                """
+                SwitchFields is the 'Encoding' Field in OptionSets to be
+                compatible with 1.04 structs we added
+                the 'Encoding' Field before and skip the SwitchField Field
+                """
+                uatype = f"'ua.{sfield.uatype}'"
+                if sfield.array:
+                    uatype = f"List[{uatype}]"
+                if uatype == "List[ua.Char]":
+                    uatype = "String"
+                if sfield.is_optional:
+                    code += f"    {sfield.name}: Optional[{uatype}] = None\n"
+                else:
+                    uavalue = sfield.value
+                    if isinstance(uavalue, str) and uavalue.startswith("ua."):
+                        uavalue = f"field(default_factory=lambda: {uavalue})"
+                    code += f"    {sfield.name}:{uatype} = {uavalue}\n"
         return code
 
 
-class Field(object):
+class Field:
     def __init__(self, name):
         self.name = name
         self.uatype = None
@@ -117,7 +124,7 @@ class Field(object):
     __repr__ = __str__
 
 
-class StructGenerator(object):
+class StructGenerator:
     def __init__(self):
         self.model = []
 
@@ -129,6 +136,14 @@ class StructGenerator(object):
         obj = ET.parse(path)
         root = obj.getroot()
         self._make_model(root)
+
+    def _is_array_field(self, name):
+        if name.startswith("NoOf"):
+            return True
+        if name.startswith("__") and name.endswith("Length"):
+            # Codesys syntax
+            return True
+        return False
 
     def _make_model(self, root):
         enums = {}
@@ -153,22 +168,22 @@ class StructGenerator(object):
                     if xmlfield.tag.endswith("Field"):
                         name = xmlfield.get("Name")
                         _clean_name = clean_name(name)
-                        if name.startswith("NoOf"):
+                        if self._is_array_field(name):
                             array = True
                             continue
                         _type = xmlfield.get("TypeName")
                         if ":" in _type:
                             _type = _type.split(":")[1]
-                        if _type == 'Bit':
+                        if _type == "Bit":
                             # Bits are used for bit fields and filler ignore
                             continue
                         field = Field(_clean_name)
                         field.uatype = clean_name(_type)
-                        if xmlfield.get("SwitchField", '') != '':
+                        if xmlfield.get("SwitchField", "") != "":
                             # Optional Field
                             field.is_optional = True
                             struct.option_counter += 1
-                        field.value = get_default_value(field.uatype, enums)
+                        field.value = get_default_value(field.uatype, enums, hack=True)
                         if array:
                             field.array = True
                             field.value = "field(default_factory=list)"
@@ -190,8 +205,10 @@ class StructGenerator(object):
         for struct in self.model:
             if isinstance(struct, EnumType):
                 continue  # No registration required for enums
-            code += f"ua.register_extension_object('{struct.name}'," \
-                    f" ua.NodeId.from_string('{struct.typeid}'), {struct.name})\n"
+            code += (
+                f"ua.register_extension_object('{struct.name}',"
+                f" ua.NodeId.from_string('{struct.typeid}'), {struct.name})\n"
+            )
         return code
 
     def get_python_classes(self, env=None):
@@ -203,7 +220,7 @@ class StructGenerator(object):
 THIS FILE IS AUTOGENERATED, DO NOT EDIT!!!
 '''
 
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 from dataclasses import dataclass, field
 from typing import List, Union
@@ -222,10 +239,10 @@ from asyncua import ua
 async def load_type_definitions(server, nodes=None):
     """
     Download xml from given variable node defining custom structures.
-    If no node is given, attemps to import variables from all nodes under
+    If no node is given, attempts to import variables from all nodes under
     "0:OPC Binary"
     the code is generated and imported on the fly. If you know the structures
-    are not going to be modified it might be interresting to copy the generated files
+    are not going to be modified it might be interesting to copy the generated files
     and include them in you code
     """
     if nodes is None:
@@ -245,7 +262,7 @@ async def load_type_definitions(server, nodes=None):
         generator.get_python_classes(structs_dict)
         # same but using a file that is imported. This can be useful for debugging library
         # name = node.read_browse_name().Name
-        # Make sure structure names do not contain charaters that cannot be used in Python class file names
+        # Make sure structure names do not contain characters that cannot be used in Python class file names
         # name = clean_name(name)
         # name = "structures_" + node.read_browse_name().Name
         # generator.save_and_import(name + ".py", append_to=structs_dict)
@@ -254,7 +271,9 @@ async def load_type_definitions(server, nodes=None):
         # every children of our node should represent a class
         for ndesc in await node.get_children_descriptions():
             ndesc_node = server.get_node(ndesc.NodeId)
-            ref_desc_list = await ndesc_node.get_references(refs=ua.ObjectIds.HasDescription, direction=ua.BrowseDirection.Inverse)
+            ref_desc_list = await ndesc_node.get_references(
+                refs=ua.ObjectIds.HasDescription, direction=ua.BrowseDirection.Inverse
+            )
             if ref_desc_list:  # some server put extra things here
                 name = clean_name(ndesc.BrowseName.Name)
                 if name not in structs_dict:
@@ -262,7 +281,7 @@ async def load_type_definitions(server, nodes=None):
                     continue
                 nodeid = ref_desc_list[0].NodeId
                 ua.register_extension_object(name, nodeid, structs_dict[name])
-                # save the typeid if user want to create static file for type definitnion
+                # save the typeid if user want to create static file for type definition
                 generator.set_typeid(name, nodeid.to_string())
 
         for key, val in structs_dict.items():
@@ -283,21 +302,22 @@ def _generate_python_class(model, env=None):
         env = ua.__dict__
     #  Add the required libraries to dict
     if "ua" not in env:
-        env['ua'] = ua
+        env["ua"] = ua
     if "datetime" not in env:
-        env['datetime'] = datetime
+        env["datetime"] = datetime
+        env["timezone"] = timezone
     if "uuid" not in env:
-        env['uuid'] = uuid
+        env["uuid"] = uuid
     if "enum" not in env:
-        env['IntEnum'] = IntEnum
+        env["IntEnum"] = IntEnum
     if "dataclass" not in env:
-        env['dataclass'] = dataclass
+        env["dataclass"] = dataclass
     if "field" not in env:
-        env['field'] = field
+        env["field"] = field
     if "List" not in env:
-        env['List'] = List
-    if 'Optional' not in env:
-        env['Optional'] = Optional
+        env["List"] = List
+    if "Optional" not in env:
+        env["Optional"] = Optional
     # generate classes one by one and add them to dict
     for element in model:
         code = element.get_code()

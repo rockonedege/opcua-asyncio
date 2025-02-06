@@ -3,17 +3,35 @@ High level node object, to access node attribute
 and browse address space
 """
 
+from datetime import datetime
 import logging
-from typing import Union
+import sys
+from typing import Any, Iterable, List, Optional, Set, Union, overload
+
+if sys.version_info >= (3, 8):
+    from typing import Literal
+else:
+    from typing_extensions import Literal
 
 from asyncua import ua
 from asyncua.common.session_interface import AbstractSession
+from asyncua.ua.uaerrors import UaInvalidParameterError
 from .ua_utils import value_to_datavalue
 
 from .events import Event, get_filter_from_event_type
 from .ua_utils import data_type_to_variant_type
-from .manage_nodes import create_folder, create_object, create_object_type, create_variable, create_variable_type, \
-    create_data_type, create_property, delete_nodes, create_method, create_reference_type
+from .manage_nodes import (
+    create_folder,
+    create_object,
+    create_object_type,
+    create_variable,
+    create_variable_type,
+    create_data_type,
+    create_property,
+    delete_nodes,
+    create_method,
+    create_reference_type,
+)
 from .methods import call_method
 
 _logger = logging.getLogger(__name__)
@@ -26,14 +44,14 @@ def _check_results(results, reqlen=1):
         r.check()
 
 
-def _to_nodeid(nodeid):
+def _to_nodeid(nodeid: Union["Node", ua.NodeId, str, int]) -> ua.NodeId:
     if isinstance(nodeid, int):
         return ua.TwoByteNodeId(nodeid)
     if isinstance(nodeid, Node):
         return nodeid.nodeid
     if isinstance(nodeid, ua.NodeId):
         return nodeid
-    if type(nodeid) in (str, bytes):
+    if isinstance(nodeid, str):
         return ua.NodeId.from_string(nodeid)
     raise ua.UaError(f"Could not resolve '{nodeid}' to a type id")
 
@@ -46,19 +64,23 @@ class Node:
     OPC-UA protocol. Feel free to look at the code of this class and call
     directly UA services methods to optimize your code
     """
-    def __init__(self, session: AbstractSession, nodeid: Union[ua.NodeId, str, int]):
+
+    def __init__(self, session: AbstractSession, nodeid: Union["Node", ua.NodeId, str, int]):
         self.session = session
-        self.nodeid = None
+        self.nodeid: ua.NodeId
         if isinstance(nodeid, Node):
             self.nodeid = nodeid.nodeid
         elif isinstance(nodeid, ua.NodeId):
             self.nodeid = nodeid
-        elif type(nodeid) in (str, bytes):
+        elif isinstance(nodeid, str):
             self.nodeid = ua.NodeId.from_string(nodeid)
         elif isinstance(nodeid, int):
             self.nodeid = ua.NodeId(nodeid, 0)
         else:
-            raise ua.UaError(f"argument to node must be a NodeId object or a string" f" defining a nodeid found {nodeid} of type {type(nodeid)}")
+            raise ua.UaError(
+                f"argument to node must be a NodeId object or a string"
+                f" defining a nodeid found {nodeid} of type {type(nodeid)}"
+            )
         self.basenodeid = None
 
     def __eq__(self, other):
@@ -78,83 +100,103 @@ class Node:
     def __hash__(self):
         return self.nodeid.__hash__()
 
-    async def read_browse_name(self):
+    async def read_browse_name(self) -> ua.QualifiedName:
         """
         Get browse name of a node. A browse name is a QualifiedName object
         composed of a string(name) and a namespace index.
         """
         result = await self.read_attribute(ua.AttributeIds.BrowseName)
+        if result.Value is None:
+            raise UaInvalidParameterError("Value must not be None if the result is in Good status")
         return result.Value.Value
 
-    async def read_display_name(self):
+    async def read_display_name(self) -> ua.LocalizedText:
         """
-        get description attribute of node
+        get DisplayName attribute of node
         """
         result = await self.read_attribute(ua.AttributeIds.DisplayName)
+        if result.Value is None:
+            raise UaInvalidParameterError("Value must not be None if the result is in Good status")
         return result.Value.Value
 
-    async def read_data_type(self):
+    async def read_data_type(self) -> ua.NodeId:
         """
         get data type of node as NodeId
         """
         result = await self.read_attribute(ua.AttributeIds.DataType)
+        if result.Value is None:
+            raise UaInvalidParameterError("Value must not be None if the result is in Good status")
         return result.Value.Value
 
-    async def read_data_type_as_variant_type(self):
+    async def read_data_type_as_variant_type(self) -> ua.VariantType:
         """
         get data type of node as VariantType
         This only works if node is a variable, otherwise type
         may not be convertible to VariantType
         """
         result = await self.read_attribute(ua.AttributeIds.DataType)
+        if result.Value is None:
+            raise UaInvalidParameterError("Value must not be None if the result is in Good status")
         return await data_type_to_variant_type(Node(self.session, result.Value.Value))
 
-    async def get_access_level(self):
+    async def get_access_level(self) -> Set[ua.AccessLevel]:
         """
         Get the access level attribute of the node as a set of AccessLevel enum values.
         """
         result = await self.read_attribute(ua.AttributeIds.AccessLevel)
+        if result.Value is None:
+            raise UaInvalidParameterError("Value must not be None if the result is in Good status")
         return ua.AccessLevel.parse_bitfield(result.Value.Value)
 
-    async def get_user_access_level(self):
+    async def get_user_access_level(self) -> Set[ua.AccessLevel]:
         """
         Get the user access level attribute of the node as a set of AccessLevel enum values.
         """
         result = await self.read_attribute(ua.AttributeIds.UserAccessLevel)
+        if result.Value is None:
+            raise UaInvalidParameterError("Value must not be None if the result is in Good status")
         return ua.AccessLevel.parse_bitfield(result.Value.Value)
 
-    async def read_event_notifier(self):
+    async def read_event_notifier(self) -> Set[ua.EventNotifier]:
         """
         Get the event notifier attribute of the node as a set of EventNotifier enum values.
         """
         result = await self.read_attribute(ua.AttributeIds.EventNotifier)
+        if result.Value is None:
+            raise UaInvalidParameterError("Value must not be None if the result is in Good status")
         return ua.EventNotifier.parse_bitfield(result.Value.Value)
 
-    async def set_event_notifier(self, values):
+    async def set_event_notifier(self, values) -> None:
         """
         Set the event notifier attribute.
 
         :param values: an iterable of EventNotifier enum values.
         """
         event_notifier_bitfield = ua.EventNotifier.to_bitfield(values)
-        await self.write_attribute(ua.AttributeIds.EventNotifier, ua.DataValue(ua.Variant(event_notifier_bitfield, ua.VariantType.Byte)))
+        await self.write_attribute(
+            ua.AttributeIds.EventNotifier, ua.DataValue(ua.Variant(event_notifier_bitfield, ua.VariantType.Byte))
+        )
 
-    async def read_node_class(self):
+    async def read_node_class(self) -> ua.NodeClass:
         """
         get node class attribute of node
         """
         result = await self.read_attribute(ua.AttributeIds.NodeClass)
+        if result.Value is None:
+            raise UaInvalidParameterError("Value must not be None if the result is in Good status")
         return ua.NodeClass(result.Value.Value)
 
-    async def read_data_type_definition(self):
+    async def read_data_type_definition(self) -> ua.DataTypeDefinition:
         """
         read data type definition attribute of node
         only DataType nodes following spec >= 1.04 have that attribute
         """
         result = await self.read_attribute(ua.AttributeIds.DataTypeDefinition)
+        if result.Value is None:
+            raise UaInvalidParameterError("Value must not be None if the result is in Good status")
         return result.Value.Value
 
-    async def write_data_type_definition(self, sdef: ua.DataTypeDefinition):
+    async def write_data_type_definition(self, sdef: ua.DataTypeDefinition) -> None:
         """
         write data type definition attribute of node
         only DataType nodes following spec >= 1.04 have that attribute
@@ -162,14 +204,16 @@ class Node:
         v = ua.Variant(sdef, ua.VariantType.ExtensionObject)
         await self.write_attribute(ua.AttributeIds.DataTypeDefinition, ua.DataValue(v))
 
-    async def read_description(self):
+    async def read_description(self) -> ua.LocalizedText:
         """
         get description attribute class of node
         """
         result = await self.read_attribute(ua.AttributeIds.Description)
+        if result.Value is None:
+            raise UaInvalidParameterError("Value must not be None if the result is in Good status")
         return result.Value.Value
 
-    async def read_value(self):
+    async def read_value(self) -> Any:
         """
         Get value of a node as a python type. Only variables ( and properties) have values.
         An exception will be generated for other node types.
@@ -177,11 +221,13 @@ class Node:
         Do not modify it if it is a mutable object unless you know what you are doing
         """
         result = await self.read_data_value()
+        if result.Value is None:
+            raise UaInvalidParameterError("Value must not be None if the result is in Good status")
         return result.Value.Value
 
     get_value = read_value  # legacy compatibility
 
-    async def read_data_value(self, raise_on_bad_status=True):
+    async def read_data_value(self, raise_on_bad_status: bool = True) -> ua.DataValue:
         """
         Get value of a node as a DataValue object. Only variables (and properties) have values.
         An exception will be generated for other node types.
@@ -189,7 +235,7 @@ class Node:
         """
         return await self.read_attribute(ua.AttributeIds.Value, None, raise_on_bad_status)
 
-    async def write_array_dimensions(self, value):
+    async def write_array_dimensions(self, value: int) -> None:
         """
         Set attribute ArrayDimensions of node
         make sure it has the correct data type
@@ -197,28 +243,32 @@ class Node:
         v = ua.Variant(value, ua.VariantType.UInt32)
         await self.write_attribute(ua.AttributeIds.ArrayDimensions, ua.DataValue(v))
 
-    async def read_array_dimensions(self):
+    async def read_array_dimensions(self) -> List[int]:
         """
         Read and return ArrayDimensions attribute of node
         """
         res = await self.read_attribute(ua.AttributeIds.ArrayDimensions)
+        if res.Value is None:
+            raise UaInvalidParameterError("Value must not be None if the result is in Good status")
         return res.Value.Value
 
-    async def write_value_rank(self, value):
+    async def write_value_rank(self, value: int) -> None:
         """
         Set attribute ValueRank of node
         """
         v = ua.Variant(value, ua.VariantType.Int32)
         await self.write_attribute(ua.AttributeIds.ValueRank, ua.DataValue(v))
 
-    async def read_value_rank(self):
+    async def read_value_rank(self) -> int:
         """
         Read and return ValueRank attribute of node
         """
         res = await self.read_attribute(ua.AttributeIds.ValueRank)
+        if res.Value is None:
+            raise UaInvalidParameterError("Value must not be None if the result is in Good status")
         return ua.ValueRank(res.Value.Value)
 
-    async def write_value(self, value, varianttype=None):
+    async def write_value(self, value: Any, varianttype: Optional[ua.VariantType] = None) -> None:
         """
         Write value of a node. Only variables(properties) have values.
         An exception will be generated for other node types.
@@ -237,7 +287,7 @@ class Node:
     set_data_value = write_value  # legacy compatibility
     set_value = write_value  # legacy compatibility
 
-    async def set_writable(self, writable=True):
+    async def set_writable(self, writable: bool = True) -> None:
         """
         Set node as writable by clients.
         A node is always writable on server side.
@@ -249,24 +299,30 @@ class Node:
             await self.unset_attr_bit(ua.AttributeIds.AccessLevel, ua.AccessLevel.CurrentWrite)
             await self.unset_attr_bit(ua.AttributeIds.UserAccessLevel, ua.AccessLevel.CurrentWrite)
 
-    async def set_attr_bit(self, attr, bit):
+    async def set_attr_bit(self, attr: ua.AttributeIds, bit: int) -> None:
         dv = await self.read_attribute(attr)
+        if dv.Value is None:
+            raise UaInvalidParameterError("Value must not be None if the result is in Good status")
         val = ua.ua_binary.set_bit(dv.Value.Value, bit)
         await self.write_attribute(attr, ua.DataValue(ua.Variant(val, dv.Value.VariantType)))
 
-    async def unset_attr_bit(self, attr, bit):
+    async def unset_attr_bit(self, attr: ua.AttributeIds, bit: int) -> None:
         dv = await self.read_attribute(attr)
+        if dv.Value is None:
+            raise UaInvalidParameterError("Value must not be None if the result is in Good status")
         val = ua.ua_binary.unset_bit(dv.Value.Value, bit)
         await self.write_attribute(attr, ua.DataValue(ua.Variant(val, dv.Value.VariantType)))
 
-    def set_read_only(self):
+    async def set_read_only(self) -> None:
         """
         Set a node as read-only for clients.
         A node is always writable on server side.
         """
-        return self.set_writable(False)
+        return await self.set_writable(False)
 
-    async def write_attribute(self, attributeid, datavalue, indexrange=None):
+    async def write_attribute(
+        self, attributeid: ua.AttributeIds, datavalue: ua.DataValue, indexrange: Optional[str] = None
+    ) -> None:
         """
         Set an attribute of a node
         attributeid is a member of ua.AttributeIds
@@ -284,11 +340,13 @@ class Node:
         result = await self.session.write(params)
         result[0].check()
 
-    async def write_params(self, params):
+    async def write_params(self, params: ua.WriteParameters) -> List[ua.StatusCode]:
         result = await self.session.write(params)
         return result
 
-    async def read_attribute(self, attr, indexrange=None, raise_on_bad_status=True):
+    async def read_attribute(
+        self, attr: ua.AttributeIds, indexrange: Optional[str] = None, raise_on_bad_status: bool = True
+    ) -> ua.DataValue:
         """
         Read one attribute of a node
         attributeid is a member of ua.AttributeIds
@@ -306,7 +364,7 @@ class Node:
             result[0].StatusCode.check()
         return result[0]
 
-    async def read_attributes(self, attrs):
+    async def read_attributes(self, attrs: Iterable[ua.AttributeIds]) -> List[ua.DataValue]:
         """
         Read several attributes of a node
         list of DataValue is returned
@@ -321,11 +379,15 @@ class Node:
         results = await self.session.read(params)
         return results
 
-    async def read_params(self, params):
+    async def read_params(self, params: ua.ReadParameters) -> List[ua.DataValue]:
         result = await self.session.read(params)
         return result
 
-    async def get_children(self, refs=ua.ObjectIds.HierarchicalReferences, nodeclassmask=ua.NodeClass.Unspecified):
+    async def get_children(
+        self,
+        refs: int = ua.ObjectIds.HierarchicalReferences,
+        nodeclassmask: ua.NodeClass = ua.NodeClass.Unspecified,
+    ) -> List["Node"]:
         """
         Get all children of a node. By default hierarchical references and all node classes are returned.
         Other reference types may be given:
@@ -349,38 +411,51 @@ class Node:
         """
         return await self.get_referenced_nodes(refs, ua.BrowseDirection.Forward, nodeclassmask)
 
-    def get_properties(self):
+    async def get_properties(self) -> List["Node"]:
         """
         return properties of node.
         properties are child nodes with a reference of type HasProperty and a NodeClass of Variable
         COROUTINE
         """
-        return self.get_children(refs=ua.ObjectIds.HasProperty, nodeclassmask=ua.NodeClass.Variable)
+        return await self.get_children(refs=ua.ObjectIds.HasProperty, nodeclassmask=ua.NodeClass.Variable)
 
-    def get_variables(self):
+    async def get_variables(self) -> List["Node"]:
         """
         return variables of node.
         variables are child nodes with a reference of type HasComponent and a NodeClass of Variable
         """
-        return self.get_children(refs=ua.ObjectIds.HasComponent, nodeclassmask=ua.NodeClass.Variable)
+        return await self.get_children(refs=ua.ObjectIds.HasComponent, nodeclassmask=ua.NodeClass.Variable)
 
-    def get_methods(self):
+    async def get_methods(self) -> List["Node"]:
         """
         return methods of node.
         methods are child nodes with a reference of type HasComponent and a NodeClass of Method
         """
-        return self.get_children(refs=ua.ObjectIds.HasComponent, nodeclassmask=ua.NodeClass.Method)
+        return await self.get_children(refs=ua.ObjectIds.HasComponent, nodeclassmask=ua.NodeClass.Method)
 
-    async def get_children_descriptions(self, refs=ua.ObjectIds.HierarchicalReferences, nodeclassmask=ua.NodeClass.Unspecified, includesubtypes=True, result_mask=ua.BrowseResultMask.All):
+    async def get_children_descriptions(
+        self,
+        refs: int = ua.ObjectIds.HierarchicalReferences,
+        nodeclassmask: ua.NodeClass = ua.NodeClass.Unspecified,
+        includesubtypes: bool = True,
+        result_mask: ua.BrowseResultMask = ua.BrowseResultMask.All,
+    ) -> List[ua.ReferenceDescription]:
         return await self.get_references(refs, ua.BrowseDirection.Forward, nodeclassmask, includesubtypes, result_mask)
 
-    def get_encoding_refs(self):
-        return self.get_referenced_nodes(ua.ObjectIds.HasEncoding, ua.BrowseDirection.Forward)
+    async def get_encoding_refs(self) -> List["Node"]:
+        return await self.get_referenced_nodes(ua.ObjectIds.HasEncoding, ua.BrowseDirection.Forward)
 
-    def get_description_refs(self):
-        return self.get_referenced_nodes(ua.ObjectIds.HasDescription, ua.BrowseDirection.Forward)
+    async def get_description_refs(self) -> List["Node"]:
+        return await self.get_referenced_nodes(ua.ObjectIds.HasDescription, ua.BrowseDirection.Forward)
 
-    async def get_references(self, refs=ua.ObjectIds.References, direction=ua.BrowseDirection.Both, nodeclassmask=ua.NodeClass.Unspecified, includesubtypes=True, result_mask=ua.BrowseResultMask.All):
+    async def get_references(
+        self,
+        refs: int = ua.ObjectIds.References,
+        direction: ua.BrowseDirection = ua.BrowseDirection.Both,
+        nodeclassmask: ua.NodeClass = ua.NodeClass.Unspecified,
+        includesubtypes: bool = True,
+        result_mask: ua.BrowseResultMask = ua.BrowseResultMask.All,
+    ) -> List[ua.ReferenceDescription]:
         """
         returns references of the node based on specific filter defined with:
 
@@ -405,17 +480,27 @@ class Node:
         references = await self._browse_next(results)
         return references
 
-    async def _browse_next(self, results):
+    async def _browse_next(self, results: List[ua.BrowseResult]) -> List[ua.ReferenceDescription]:
+        if not results:
+            return []
         references = results[0].References
         while results[0].ContinuationPoint:
             params = ua.BrowseNextParameters()
             params.ContinuationPoints = [results[0].ContinuationPoint]
             params.ReleaseContinuationPoints = False
             results = await self.session.browse_next(params)
+            if not results:
+                break
             references.extend(results[0].References)
         return references
 
-    async def get_referenced_nodes(self, refs=ua.ObjectIds.References, direction=ua.BrowseDirection.Both, nodeclassmask=ua.NodeClass.Unspecified, includesubtypes=True):
+    async def get_referenced_nodes(
+        self,
+        refs: int = ua.ObjectIds.References,
+        direction: ua.BrowseDirection = ua.BrowseDirection.Both,
+        nodeclassmask: ua.NodeClass = ua.NodeClass.Unspecified,
+        includesubtypes: bool = True,
+    ) -> List["Node"]:
         """
         returns referenced nodes based on specific filter
         Parameters are the same as for get_references
@@ -428,32 +513,39 @@ class Node:
             nodes.append(node)
         return nodes
 
-    async def read_type_definition(self):
+    async def read_type_definition(self) -> Optional[ua.NodeId]:
         """
         returns type definition of the node.
         """
-        references = await self.get_references(refs=ua.ObjectIds.HasTypeDefinition, direction=ua.BrowseDirection.Forward)
+        references = await self.get_references(
+            refs=ua.ObjectIds.HasTypeDefinition, direction=ua.BrowseDirection.Forward
+        )
         if len(references) == 0:
             return None
         return references[0].NodeId
 
-    async def get_path(self, max_length=20, as_string=False):
+    @overload
+    async def get_path(self, max_length: int = 20, as_string: Literal[False] = False) -> List["Node"]: ...
+
+    @overload
+    async def get_path(self, max_length: int = 20, as_string: Literal[True] = True) -> List["str"]: ...
+
+    async def get_path(self, max_length: int = 20, as_string: bool = False) -> Union[List["Node"], List[str]]:
         """
         Attempt to find path of node from root node and return it as a list of Nodes.
         There might several possible paths to a node, this function will return one
         Some nodes may be missing references, so this method may
         return an empty list
         Since address space may have circular references, a max length is specified
-
         """
         path = await self._get_path(max_length)
-        path = [Node(self.session, ref.NodeId) for ref in path]
-        path.append(self)
+        nodes = [Node(self.session, ref.NodeId) for ref in path]
+        nodes.append(self)
         if as_string:
-            path = [(await el.read_browse_name()).to_string() for el in path]
-        return path
+            return [(await el.read_browse_name()).to_string() for el in nodes]
+        return nodes
 
-    async def _get_path(self, max_length=20):
+    async def _get_path(self, max_length: int = 20) -> List[ua.ReferenceDescription]:
         """
         Attempt to find path of node from root node and return it as a list of Nodes.
         There might several possible paths to a node, this function will return one
@@ -465,7 +557,9 @@ class Node:
         path = []
         node = self
         while True:
-            refs = await node.get_references(refs=ua.ObjectIds.HierarchicalReferences, direction=ua.BrowseDirection.Inverse)
+            refs = await node.get_references(
+                refs=ua.ObjectIds.HierarchicalReferences, direction=ua.BrowseDirection.Inverse
+            )
             if len(refs) > 0:
                 path.insert(0, refs[0])
                 node = Node(self.session, refs[0].NodeId)
@@ -474,7 +568,7 @@ class Node:
             else:
                 return path
 
-    async def get_parent(self):
+    async def get_parent(self) -> Optional["Node"]:
         """
         returns parent of the node.
         A Node may have several parents, the first found is returned.
@@ -486,29 +580,87 @@ class Node:
             return Node(self.session, refs[0].NodeId)
         return None
 
-    async def get_child(self, path, return_all=False):
+    @overload
+    async def get_child(
+        self,
+        path: Union[ua.QualifiedName, str, Iterable[Union[ua.QualifiedName, str]]],
+        return_all: Literal[False] = False,
+    ) -> "Node": ...
+
+    @overload
+    async def get_child(
+        self,
+        path: Union[ua.QualifiedName, str, Iterable[Union[ua.QualifiedName, str]]],
+        return_all: Literal[True] = True,
+    ) -> List["Node"]: ...
+
+    async def get_child(
+        self, path: Union[ua.QualifiedName, str, Iterable[Union[ua.QualifiedName, str]]], return_all: bool = False
+    ) -> Union["Node", List["Node"]]:
         """
         get a child specified by its path from this node.
         A path might be:
-        * a string representing a qualified name.
+        * a string representing a relative path as per UA spec
         * a qualified name
-        * a list of string
+        * a list of string representing browsenames (legacy)
         * a list of qualified names
         """
-        if type(path) not in (list, tuple):
-            path = [path]
-        rpath = self._make_relative_path(path)
+        if isinstance(path, str):
+            rpath = ua.RelativePath.from_string(path)
+        else:
+            if isinstance(path, ua.QualifiedName):
+                path = [path]
+            rpath = self._make_relative_path(path)
         bpath = ua.BrowsePath()
         bpath.StartingNode = self.nodeid
         bpath.RelativePath = rpath
-        result = await self.session.translate_browsepaths_to_nodeids([bpath])
-        result = result[0]
+        results = await self.session.translate_browsepaths_to_nodeids([bpath])
+        result = results[0]
         result.StatusCode.check()
         if return_all:
             return [Node(self.session, target.TargetId) for target in result.Targets]
         return Node(self.session, result.Targets[0].TargetId)
 
-    def _make_relative_path(self, path):
+    async def get_children_by_path(
+        self,
+        paths: Iterable[Union[ua.QualifiedName, str, Iterable[Union[ua.QualifiedName, str]]]],
+        raise_on_partial_error: bool = True,
+    ) -> List[List[Optional["Node"]]]:
+        """
+        get children specified by their paths from this node.
+        A path might be:
+        * a string representing a relative path as per UA spec
+        * a qualified name
+        * a list of string representing browsenames (legacy)
+        * a list of qualified names
+        """
+        bpaths: List[ua.BrowsePath] = []
+        for path in paths:
+            if isinstance(path, str):
+                rpath = ua.RelativePath.from_string(path)
+            else:
+                if isinstance(path, (ua.QualifiedName, str)):
+                    path = [path]
+                rpath = self._make_relative_path(path)
+            bpath = ua.BrowsePath()
+            bpath.StartingNode = self.nodeid
+            bpath.RelativePath = rpath
+            bpaths.append(bpath)
+
+        results = await self.session.translate_browsepaths_to_nodeids(bpaths)
+        try:
+            if raise_on_partial_error:
+                for result in results:
+                    result.StatusCode.check()
+        except ua.UaStatusCodeError:
+            codes = [result.StatusCode.value for result in results]
+            raise ua.UaStatusCodeErrors(codes)
+        return [
+            [Node(self.session, target.TargetId) for target in result.Targets] if result.StatusCode.is_good() else None
+            for result in results
+        ]
+
+    def _make_relative_path(self, path: Iterable[Union[ua.QualifiedName, str]]) -> ua.RelativePath:
         rpath = ua.RelativePath()
         for item in path:
             el = ua.RelativePathElement()
@@ -522,7 +674,13 @@ class Node:
             rpath.Elements.append(el)
         return rpath
 
-    async def read_raw_history(self, starttime=None, endtime=None, numvalues=0, return_bounds=True):
+    async def read_raw_history(
+        self,
+        starttime: Optional[datetime] = None,
+        endtime: Optional[datetime] = None,
+        numvalues: int = 0,
+        return_bounds: bool = True,
+    ) -> List[ua.DataValue]:
         """
         Read raw history of a node
         result code from server is checked and an exception is raised in case of error
@@ -547,21 +705,25 @@ class Node:
             result = await self.history_read(details, continuation_point)
             result.StatusCode.check()
             continuation_point = result.ContinuationPoint
-            history.extend(result.HistoryData.DataValues)
+            history.extend(result.HistoryData.DataValues)  # type: ignore[attr-defined]
             # No more data available
             if continuation_point is None:
                 break
-
+            # No more data needed
+            if numvalues > 0:
+                break
         return history
 
-    async def history_read(self, details, continuation_point=None):
+    async def history_read(
+        self, details: ua.ReadRawModifiedDetails, continuation_point: Optional[bytes] = None
+    ) -> ua.HistoryReadResult:
         """
         Read raw history of a node, low-level function
         result code from server is checked and an exception is raised in case of error
         """
         valueid = ua.HistoryReadValueId()
         valueid.NodeId = self.nodeid
-        valueid.IndexRange = ''
+        valueid.IndexRange = ""
         valueid.ContinuationPoint = continuation_point
         params = ua.HistoryReadParameters()
         params.HistoryReadDetails = details
@@ -570,7 +732,15 @@ class Node:
         params.NodesToRead.append(valueid)
         return (await self.session.history_read(params))[0]
 
-    async def read_event_history(self, starttime=None, endtime=None, numvalues=0, evtypes=ua.ObjectIds.BaseEventType):
+    async def read_event_history(
+        self,
+        starttime: datetime = None,
+        endtime: datetime = None,
+        numvalues: int = 0,
+        evtypes: Union[
+            "Node", ua.NodeId, str, int, Iterable[Union["Node", ua.NodeId, str, int]]
+        ] = ua.ObjectIds.BaseEventType,
+    ) -> List[Event]:
         """
         Read event history of a source node
         result code from server is checked and an exception is raised in case of error
@@ -587,26 +757,26 @@ class Node:
         else:
             details.EndTime = ua.get_win_epoch()
         details.NumValuesPerNode = numvalues
-        if not isinstance(evtypes, (list, tuple)):
+        if isinstance(evtypes, (Node, ua.NodeId, str, int)):
             evtypes = [evtypes]
-        evtypes = [Node(self.session, evtype) for evtype in evtypes]
-        evfilter = await get_filter_from_event_type(evtypes)
+        evtype_nodes = [Node(self.session, evtype) for evtype in evtypes]
+        evfilter = await get_filter_from_event_type(evtype_nodes)
         details.Filter = evfilter
         result = await self.history_read_events(details)
         result.StatusCode.check()
         event_res = []
-        for res in result.HistoryData.Events:
+        for res in result.HistoryData.Events:  # type: ignore[attr-defined]
             event_res.append(Event.from_event_fields(evfilter.SelectClauses, res.EventFields))
         return event_res
 
-    async def history_read_events(self, details):
+    async def history_read_events(self, details: Iterable[ua.ReadEventDetails]) -> ua.HistoryReadResult:
         """
         Read event history of a node, low-level function
         result code from server is checked and an exception is raised in case of error
         """
         valueid = ua.HistoryReadValueId()
         valueid.NodeId = self.nodeid
-        valueid.IndexRange = ''
+        valueid.IndexRange = ""
         params = ua.HistoryReadParameters()
         params.HistoryReadDetails = details
         params.TimestampsToReturn = ua.TimestampsToReturn.Both
@@ -614,7 +784,7 @@ class Node:
         params.NodesToRead.append(valueid)
         return (await self.session.history_read(params))[0]
 
-    async def delete(self, delete_references=True, recursive=False):
+    async def delete(self, delete_references: bool = True, recursive: bool = False) -> List["Node"]:
         """
         Delete node from address space
         """
@@ -623,7 +793,7 @@ class Node:
             r.check()
         return nodes
 
-    def _fill_delete_reference_item(self, rdesc, bidirectional=False):
+    def _fill_delete_reference_item(self, rdesc: ua.ReferenceDescription, bidirectional: bool = False):
         ditem = ua.DeleteReferencesItem()
         ditem.SourceNodeId = self.nodeid
         ditem.TargetNodeId = rdesc.NodeId
@@ -632,7 +802,9 @@ class Node:
         ditem.DeleteBidirectional = bidirectional
         return ditem
 
-    async def delete_reference(self, target, reftype, forward=True, bidirectional=True):
+    async def delete_reference(
+        self, target: Union["Node", ua.NodeId, str, int], reftype: int, forward: bool = True, bidirectional: bool = True
+    ) -> None:
         """
         Delete given node's references from address space
         """
@@ -647,7 +819,13 @@ class Node:
         ditem = self._fill_delete_reference_item(rdesc, bidirectional)
         (await self.session.delete_references([ditem]))[0].check()
 
-    async def add_reference(self, target, reftype, forward=True, bidirectional=True):
+    async def add_reference(
+        self,
+        target: Union["Node", ua.NodeId, str, int],
+        reftype: int,
+        forward: bool = True,
+        bidirectional: bool = True,
+    ) -> None:
         """
         Add reference to node
         """
@@ -667,7 +845,7 @@ class Node:
         results = await self.session.add_references(params)
         _check_results(results, len(params))
 
-    async def set_modelling_rule(self, mandatory: bool):
+    async def set_modelling_rule(self, mandatory: bool) -> None:
         """
         Add a modelling rule reference to Node.
         When creating a new object type, its variable and child nodes will not
@@ -682,37 +860,67 @@ class Node:
             rule = ua.ObjectIds.ModellingRule_Mandatory if mandatory else ua.ObjectIds.ModellingRule_Optional
             await self.add_reference(rule, ua.ObjectIds.HasModellingRule, True, False)
 
-    async def add_folder(self, nodeid, bname):
+    async def add_folder(self, nodeid: Union[ua.NodeId, str, int], bname: Union[ua.QualifiedName, str]) -> "Node":
         return await create_folder(self, nodeid, bname)
 
-    async def add_object(self, nodeid, bname, objecttype=None, instantiate_optional=True):
+    async def add_object(
+        self,
+        nodeid: Union[ua.NodeId, str, int],
+        bname: Union[ua.QualifiedName, str],
+        objecttype: Optional[Union[ua.NodeId, int]] = None,
+        instantiate_optional: bool = True,
+    ) -> "Node":
         return await create_object(self, nodeid, bname, objecttype, instantiate_optional)
 
-    async def add_variable(self, nodeid, bname, val, varianttype=None, datatype=None):
+    async def add_variable(
+        self,
+        nodeid: Union[ua.NodeId, str, int],
+        bname: Union[ua.QualifiedName, str],
+        val: Any,
+        varianttype: Optional[ua.VariantType] = None,
+        datatype: Optional[Union[ua.NodeId, int]] = None,
+    ) -> "Node":
         return await create_variable(self, nodeid, bname, val, varianttype, datatype)
 
-    async def add_object_type(self, nodeid, bname):
+    async def add_object_type(self, nodeid: Union[ua.NodeId, str, int], bname: Union[ua.QualifiedName, str]) -> "Node":
         return await create_object_type(self, nodeid, bname)
 
-    async def add_variable_type(self, nodeid, bname, datatype):
+    async def add_variable_type(
+        self, nodeid: Union[ua.NodeId, str, int], bname: Union[ua.QualifiedName, str], datatype: Union[ua.NodeId, int]
+    ) -> "Node":
         return await create_variable_type(self, nodeid, bname, datatype)
 
-    async def add_data_type(self, nodeid, bname, description=None):
+    async def add_data_type(
+        self, nodeid: Union[ua.NodeId, str, int], bname: Union[ua.QualifiedName, str], description: Optional[str] = None
+    ) -> "Node":
         return await create_data_type(self, nodeid, bname, description=description)
 
-    async def add_property(self, nodeid, bname, val, varianttype=None, datatype=None):
+    async def add_property(
+        self,
+        nodeid: Union[ua.NodeId, str, int],
+        bname: Union[ua.QualifiedName, str],
+        val: Any,
+        varianttype: Optional[ua.VariantType] = None,
+        datatype: Optional[Union[ua.NodeId, int]] = None,
+    ) -> "Node":
         return await create_property(self, nodeid, bname, val, varianttype, datatype)
 
-    async def add_method(self, *args):
+    async def add_method(self, *args) -> "Node":
         return await create_method(self, *args)
 
-    async def add_reference_type(self, nodeid, bname, symmetric=True, inversename=None):
+    async def add_reference_type(
+        self,
+        nodeid: Union[ua.NodeId, str, int],
+        bname: Union[ua.QualifiedName, str],
+        symmetric: bool = True,
+        inversename: Optional[str] = None,
+    ) -> "Node":
         return await create_reference_type(self, nodeid, bname, symmetric, inversename)
 
-    async def call_method(self, methodid, *args):
+    async def call_method(self, methodid: Union[ua.NodeId, ua.QualifiedName, str], *args) -> Any:
         return await call_method(self, methodid, *args)
 
-    async def register(self):
+    async def register(self) -> None:
         """
         Register node for faster read and write access (if supported by server)
         Rmw: This call modifies the nodeid of the node, the original nodeid is
@@ -722,7 +930,7 @@ class Node:
         self.basenodeid = self.nodeid
         self.nodeid = nodeid
 
-    async def unregister(self):
+    async def unregister(self) -> None:
         if self.basenodeid is None:
             return
         await self.session.unregister_nodes([self.nodeid])
@@ -730,7 +938,7 @@ class Node:
         self.basenodeid = None
 
     @staticmethod
-    def new_node(session, nodeid: ua.NodeId):
+    def new_node(session, nodeid: ua.NodeId) -> "Node":
         """
         Helper function to init nodes with out importing Node
         """

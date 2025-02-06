@@ -2,18 +2,23 @@
 from a list of nodes in the address space, build an XML file
 format is the one from opc-ua specification
 """
+
+from __future__ import annotations
+
 import logging
 import asyncio
 import functools
 from collections import OrderedDict
+from typing import Any, Union
 import xml.etree.ElementTree as Et
 import base64
-from dataclasses import fields, is_dataclass
+from dataclasses import is_dataclass
 from enum import Enum
 
+import asyncua
 from asyncua import ua
 from asyncua.ua.uatypes import type_string_from_type
-from asyncua.ua.uaerrors import UaError
+from asyncua.ua.uaerrors import UaError, UaInvalidParameterError
 from .. import Node
 from ..ua import object_ids as o_ids
 from .ua_utils import get_base_data_type
@@ -25,17 +30,12 @@ class XmlExporter:
     If it is required that for _extobj_to_etree members to the value should be written in a certain
     order it can be added to the dictionary below.
     """
+
     extobj_ordered_elements = {
-        ua.NodeId(ua.ObjectIds.Argument): [
-            'Name',
-            'DataType',
-            'ValueRank',
-            'ArrayDimensions',
-            'Description'
-        ]
+        ua.NodeId(ua.ObjectIds.Argument): ["Name", "DataType", "ValueRank", "ArrayDimensions", "Description"]
     }
 
-    def __init__(self, server, export_values: bool = False):
+    def __init__(self, server: Union[asyncua.Server, asyncua.Client], export_values: bool = False):
         """
         param: export_values: exports values from variants (CustomDataTypes are not support!)
         """
@@ -45,12 +45,12 @@ class XmlExporter:
         self._addr_idx_to_xml_idx = {}
 
         node_write_attributes = OrderedDict()
-        node_write_attributes['xmlns:xsi'] = 'http://www.w3.org/2001/XMLSchema-instance'
-        node_write_attributes['xmlns:uax'] = 'http://opcfoundation.org/UA/2008/02/Types.xsd'
-        node_write_attributes['xmlns:xsd'] = 'http://www.w3.org/2001/XMLSchema'
-        node_write_attributes['xmlns'] = 'http://opcfoundation.org/UA/2011/03/UANodeSet.xsd'
+        node_write_attributes["xmlns:xsi"] = "http://www.w3.org/2001/XMLSchema-instance"
+        node_write_attributes["xmlns:uax"] = "http://opcfoundation.org/UA/2008/02/Types.xsd"
+        node_write_attributes["xmlns:xsd"] = "http://www.w3.org/2001/XMLSchema"
+        node_write_attributes["xmlns"] = "http://opcfoundation.org/UA/2011/03/UANodeSet.xsd"
 
-        self.etree = Et.ElementTree(Et.Element('UANodeSet', node_write_attributes))
+        self.etree = Et.ElementTree(Et.Element("UANodeSet", node_write_attributes))
         self._export_values = export_values
         if self._export_values:
             self.logger.warning("Exporting values of variables is limited and can result in invalid xmls.")
@@ -64,7 +64,7 @@ class XmlExporter:
 
         Returns:
         """
-        self.logger.info('Building XML etree')
+        self.logger.info("Building XML etree")
 
         await self._add_namespaces(node_list)
         # add all nodes in the list to the XML etree
@@ -128,10 +128,10 @@ class XmlExporter:
         Returns:
         """
         # try to write the XML etree to a file
-        self.logger.info('Exporting XML file to %s', xmlpath)
+        self.logger.info("Exporting XML file to %s", xmlpath)
         if pretty:
             indent(self.etree.getroot())
-        func = functools.partial(self.etree.write, xmlpath, encoding='utf-8', xml_declaration=True)
+        func = functools.partial(self.etree.write, xmlpath, encoding="utf-8", xml_declaration=True)
         await asyncio.get_running_loop().run_in_executor(None, func)
 
     def dump_etree(self):
@@ -139,7 +139,7 @@ class XmlExporter:
         Dump etree to console for debugging
         Returns:
         """
-        self.logger.info('Dumping XML etree to console')
+        self.logger.info("Dumping XML etree to console")
         Et.dump(self.etree)
 
     async def node_to_etree(self, node):
@@ -205,9 +205,9 @@ class XmlExporter:
             node_class = await node.read_node_class()
             if node_class in (ua.NodeClass.Object, ua.NodeClass.Variable, ua.NodeClass.Method):
                 node_el.attrib["ParentNodeId"] = self._node_to_string(parent)
-        self._add_sub_el(node_el, 'DisplayName', displayname)
+        self._add_sub_el(node_el, "DisplayName", displayname)
         if desc not in (None, ""):
-            self._add_sub_el(node_el, 'Description', desc)
+            self._add_sub_el(node_el, "Description", desc)
         # FIXME: add WriteMask and UserWriteMask
         await self._add_ref_els(node_el, node)
         return node_el
@@ -228,7 +228,7 @@ class XmlExporter:
         obj_el = await self._add_node_common("UAObjectType", node)
         abstract = (await node.read_attribute(ua.AttributeIds.IsAbstract)).Value.Value
         if abstract:
-            obj_el.attrib["IsAbstract"] = 'true'
+            obj_el.attrib["IsAbstract"] = "true"
 
     async def add_variable_common(self, node, el, export_value: bool):
         dtype = await node.read_data_type()
@@ -268,12 +268,12 @@ class XmlExporter:
         if useraccesslevel not in (0, ua.AccessLevel.CurrentRead.mask):
             var_el.attrib["UserAccessLevel"] = str(useraccesslevel)
 
-        var = await node.read_attribute(ua.AttributeIds.MinimumSamplingInterval)
+        var = await node.read_attribute(ua.AttributeIds.MinimumSamplingInterval, raise_on_bad_status=False)
         if var.Value.Value:
             var_el.attrib["MinimumSamplingInterval"] = str(var.Value.Value)
         var = await node.read_attribute(ua.AttributeIds.Historizing)
         if var.Value.Value:
-            var_el.attrib["Historizing"] = 'true'
+            var_el.attrib["Historizing"] = "true"
 
     async def add_etree_variable_type(self, node):
         """
@@ -298,7 +298,7 @@ class XmlExporter:
         obj_el = await self._add_node_common("UAReferenceType", obj)
         var = await obj.read_attribute(ua.AttributeIds.InverseName, raise_on_bad_status=False)
         if var is not None and var.Value.Value is not None and var.Value.Value.Text is not None:
-            self._add_sub_el(obj_el, 'InverseName', var.Value.Value.Text)
+            self._add_sub_el(obj_el, "InverseName", var.Value.Value.Text)
 
     async def add_etree_datatype(self, obj):
         """
@@ -311,66 +311,66 @@ class XmlExporter:
             # FIXME: can probably get that name somewhere else
             bname = await obj.read_attribute(ua.AttributeIds.BrowseName)
             bname = bname.Value.Value
-            sdef_el = Et.SubElement(obj_el, 'Definition')
-            sdef_el.attrib['Name'] = bname.Name
+            sdef_el = Et.SubElement(obj_el, "Definition")
+            sdef_el.attrib["Name"] = bname.Name
             if isinstance(sdef, ua.StructureDefinition):
                 if sdef.StructureType == ua.StructureType.Union:
-                    sdef_el.attrib['IsUnion'] = 'true'
+                    sdef_el.attrib["IsUnion"] = "true"
                 elif sdef.StructureType == ua.StructureType.StructureWithOptionalFields:
-                    sdef_el.attrib['IsOptional'] = 'true'
+                    sdef_el.attrib["IsOptional"] = "true"
                 self._structure_fields_to_etree(sdef_el, sdef)
             elif isinstance(sdef, ua.EnumDefinition):
                 self._enum_fields_to_etree(sdef_el, sdef)
             else:
-                self.logger.warning("Unknown DataTypeSpecification elemnt: %s", sdef)
+                self.logger.warning("Unknown DataTypeSpecification element: %s", sdef)
 
     def _structure_fields_to_etree(self, sdef_el, sdef):
         for field in sdef.Fields:
-            field_el = Et.SubElement(sdef_el, 'Field')
-            field_el.attrib['Name'] = field.Name
-            field_el.attrib['DataType'] = self._node_to_string(field.DataType)
+            field_el = Et.SubElement(sdef_el, "Field")
+            field_el.attrib["Name"] = field.Name
+            field_el.attrib["DataType"] = self._node_to_string(field.DataType)
             if field.ValueRank != -1:
-                field_el.attrib['ValueRank'] = str(int(field.ValueRank))
+                field_el.attrib["ValueRank"] = str(int(field.ValueRank))
             if field.ArrayDimensions:
-                field_el.attrib['ArrayDimensions'] = ", ".join([str(i) for i in field.ArrayDimensions])
+                field_el.attrib["ArrayDimensions"] = ", ".join([str(i) for i in field.ArrayDimensions])
             if field.IsOptional:
-                field_el.attrib['IsOptional'] = "true"
+                field_el.attrib["IsOptional"] = "true"
 
     def _enum_fields_to_etree(self, sdef_el, sdef):
         for field in sdef.Fields:
-            field_el = Et.SubElement(sdef_el, 'Field')
-            field_el.attrib['Name'] = field.Name
-            field_el.attrib['Value'] = str(field.Value)
+            field_el = Et.SubElement(sdef_el, "Field")
+            field_el.attrib["Name"] = field.Name
+            field_el.attrib["Value"] = str(field.Value)
 
     def _add_namespace_uri_els(self, uris):
-        nuris_el = Et.Element('NamespaceUris')
+        nuris_el = Et.Element("NamespaceUris")
         for uri in uris:
-            self._add_sub_el(nuris_el, 'Uri', uri)
+            self._add_sub_el(nuris_el, "Uri", uri)
         self.etree.getroot().insert(0, nuris_el)
 
     def _add_alias_els(self):
-        aliases_el = Et.Element('Aliases')
+        aliases_el = Et.Element("Aliases")
         ordered_keys = list(self.aliases.keys())
         ordered_keys.sort()
         for nodeid in ordered_keys:
             name = self.aliases[nodeid]
-            ref_el = Et.SubElement(aliases_el, 'Alias', Alias=name)
+            ref_el = Et.SubElement(aliases_el, "Alias", Alias=name)
             ref_el.text = self._node_to_string(nodeid)
         # insert behind the namespace element
         self.etree.getroot().insert(1, aliases_el)
 
     async def _add_ref_els(self, parent_el, obj):
         refs = await obj.get_references()
-        refs_el = Et.SubElement(parent_el, 'References')
+        refs_el = Et.SubElement(parent_el, "References")
         for ref in refs:
             if ref.ReferenceTypeId.NamespaceIndex == 0 and ref.ReferenceTypeId.Identifier in o_ids.ObjectIdNames:
                 ref_name = o_ids.ObjectIdNames[ref.ReferenceTypeId.Identifier]
             else:
                 ref_name = self._node_to_string(ref.ReferenceTypeId)
-            ref_el = Et.SubElement(refs_el, 'Reference')
-            ref_el.attrib['ReferenceType'] = ref_name
+            ref_el = Et.SubElement(refs_el, "Reference")
+            ref_el.attrib["ReferenceType"] = ref_name
             if not ref.IsForward:
-                ref_el.attrib['IsForward'] = 'false'
+                ref_el.attrib["IsForward"] = "false"
             ref_el.text = self._node_to_string(ref.NodeId)
 
             self.aliases[ref.ReferenceTypeId] = ref_name
@@ -384,9 +384,7 @@ class XmlExporter:
                 except KeyError:
                     dtype_node = self.server.get_node(dtype)
                     enc_node = (
-                        await dtype_node.get_referenced_nodes(
-                            ua.ObjectIds.HasEncoding, ua.BrowseDirection.Forward
-                        )
+                        await dtype_node.get_referenced_nodes(ua.ObjectIds.HasEncoding, ua.BrowseDirection.Forward)
                     )[0]
                     type_name = ua.extension_objects_by_typeid[enc_node.nodeid].__name__
 
@@ -397,12 +395,14 @@ class XmlExporter:
     async def _val_to_etree(self, el, dtype, val):
         if dtype == ua.NodeId(ua.ObjectIds.NodeId) or dtype == ua.NodeId(ua.ObjectIds.ExpandedNodeId):
             id_el = Et.SubElement(el, "uax:Identifier")
+            if val.NamespaceIndex in self._addr_idx_to_xml_idx:
+                val = ua.NodeId(val.Identifier, NamespaceIndex=self._addr_idx_to_xml_idx[val.NamespaceIndex])
             id_el.text = val.to_string()
         elif dtype == ua.NodeId(ua.ObjectIds.Guid):
             id_el = Et.SubElement(el, "uax:String")
             id_el.text = str(val)
         elif dtype == ua.NodeId(ua.ObjectIds.Boolean):
-            el.text = 'true' if val else 'false'
+            el.text = "true" if val else "false"
         elif dtype == ua.NodeId(ua.ObjectIds.XmlElement):
             if val.Value is None:
                 val = ""
@@ -437,17 +437,19 @@ class XmlExporter:
     async def value_to_etree(self, el, dtype_name, dtype, node):
         var = await node.read_data_value(raise_on_bad_status=False)
         if var.Value.Value is not None:
-            val_el = Et.SubElement(el, 'Value')
+            val_el = Et.SubElement(el, "Value")
             await self._value_to_etree(val_el, dtype_name, dtype, var.Value.Value)
 
-    async def _value_to_etree(self, el, type_name, dtype, val):
+    async def _value_to_etree(self, el: Et.Element, type_name: str, dtype: ua.NodeId, val: Any) -> None:
         if val is None:
             return
 
         if isinstance(val, (list, tuple)):
+            if not isinstance(dtype.Identifier, int):
+                raise UaInvalidParameterError(f"Expected int, got {type(dtype.Identifier)}")
             if dtype.NamespaceIndex == 0 and dtype.Identifier <= 21:
                 elname = "uax:ListOf" + type_name
-            else:  # this is an extentionObject:
+            else:  # this is an extensionObject:
                 elname = "uax:ListOfExtensionObject"
 
             list_el = Et.SubElement(el, elname)
@@ -468,7 +470,7 @@ class XmlExporter:
             else:
                 await self._extobj_to_etree(el, type_name, dtype, val)
 
-    async def _extobj_to_etree(self, val_el, name, dtype, val):
+    async def _extobj_to_etree(self, val_el: Et.Element, name: str, dtype: ua.NodeId, val: Any) -> None:
         if "=" in name:
             try:
                 name = ua.extension_objects_by_datatype[dtype].__name__
@@ -487,11 +489,11 @@ class XmlExporter:
         struct_el = Et.SubElement(body_el, "uax:" + name)
         await self._all_fields_to_etree(struct_el, val)
 
-    async def _all_fields_to_etree(self, struct_el, val):
+    async def _all_fields_to_etree(self, struct_el: Et.Element, val: Any) -> None:
         # TODO: adding the 'ua' module to the globals to resolve the type hints might not be enough.
-        #       its possible that the type annotations also refere to classes defined in other modules.
+        #       it is possible that the type annotations also refere to classes defined in other modules.
         for field in fields_with_resolved_types(val, globalns={"ua": ua}):
-            # FIXME; what happend if we have a custom type which is not part of ObjectIds???
+            # FIXME; what happened if we have a custom type which is not part of ObjectIds???
             if field.name == "Encoding":
                 continue
             type_name = type_string_from_type(field.type)
@@ -499,13 +501,9 @@ class XmlExporter:
                 dtype = ua.NodeId(getattr(ua.ObjectIds, type_name))
             except AttributeError:
                 try:
-                    enc_node: Node = self.server.get_node(
-                        ua.extension_object_typeids[type_name]
-                    )
+                    enc_node: Node = self.server.get_node(ua.extension_object_typeids[type_name])
                     dtype_node = (
-                        await enc_node.get_referenced_nodes(
-                            ua.ObjectIds.HasEncoding, ua.BrowseDirection.Inverse
-                        )
+                        await enc_node.get_referenced_nodes(ua.ObjectIds.HasEncoding, ua.BrowseDirection.Inverse)
                     )[0]
                     dtype = dtype_node.nodeid
                 except KeyError:
@@ -513,13 +511,9 @@ class XmlExporter:
                         if cls.__class__ == field.type.__class__:
                             dtype = ua.enums_datatypes[cls]
                             break
-                    self.logger.debug(
-                        f"could not find field type {field.type} in registered types"
-                    )
+                    self.logger.debug("could not find field type %s in registered types", field.type)
                     return
-            await self.member_to_etree(
-                struct_el, field.name, dtype, getattr(val, field.name)
-            )
+            await self.member_to_etree(struct_el, field.name, dtype, getattr(val, field.name))
 
 
 def indent(elem, level=0):

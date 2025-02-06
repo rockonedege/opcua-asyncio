@@ -1,10 +1,10 @@
 import asyncio
 import logging
 from asyncua import ua
-from asyncua.server import Server, EventGenerator
+from asyncua.server import Server
 
 logging.basicConfig(level=logging.INFO)
-_logger = logging.getLogger('asyncua')
+_logger = logging.getLogger("asyncua")
 
 
 async def main():
@@ -20,16 +20,17 @@ async def main():
     # Creating a custom event: Approach 1
     # The custom event object automatically will have members from its parent (BaseEventType)
     etype = await server.create_custom_event_type(
-        idx, 'MyFirstEvent', ua.ObjectIds.BaseEventType,
-        [('MyNumericProperty', ua.VariantType.Float),
-         ('MyStringProperty', ua.VariantType.String)]
+        idx,
+        "MyFirstEvent",
+        ua.ObjectIds.BaseEventType,
+        [("MyNumericProperty", ua.VariantType.Float), ("MyStringProperty", ua.VariantType.String)],
     )
     myevgen = await server.get_event_generator(etype, myobj)
 
     # Creating a custom event: Approach 2
-    custom_etype = await server.nodes.base_event_type.add_object_type(2, 'MySecondEvent')
-    await custom_etype.add_property(2, 'MyIntProperty', ua.Variant(0, ua.VariantType.Int32))
-    await custom_etype.add_property(2, 'MyBoolProperty', ua.Variant(True, ua.VariantType.Boolean))
+    custom_etype = await server.nodes.base_event_type.add_object_type(2, "MySecondEvent")
+    await custom_etype.add_property(2, "MyIntProperty", ua.Variant(0, ua.VariantType.Int32))
+    await custom_etype.add_property(2, "MyBoolProperty", ua.Variant(True, ua.VariantType.Boolean))
     mysecondevgen = await server.get_event_generator(custom_etype, myobj)
 
     async with server:

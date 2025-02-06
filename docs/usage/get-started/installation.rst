@@ -25,7 +25,7 @@ Once the installation is completed, the package is ready to be used. To verify t
 or the report the version if you create a bugreport, the following code can be run in a python interpreter:
 
 .. code-block:: python
- 
+
     import asyncua
     print(asyncua.__version__)
 
@@ -33,16 +33,16 @@ or the report the version if you create a bugreport, the following code can be r
 Command Line Tools
 ==================
 
-Alongside the package some utility command line tools are installed: 
+Alongside the package some utility command line tools are installed:
 
-:code:`uabrowse`: 
+:code:`uabrowse`:
     Browse OPC-UA node and print result
 
-:code:`uacall`: 
+:code:`uacall`:
     Call method of a node
 
 :code:`uaclient`:
-    Connect to server and start python shell. root and objects nodes are available.Node specificed in command line is available as mynode variable.
+    Connect to server and start python shell. root and objects nodes are available. Node specified in command line is available as mynode variable.
 
 :code:`uadiscover`:
     Performs OPC UA discovery and prints information on servers and endpoints.
@@ -57,7 +57,7 @@ Alongside the package some utility command line tools are installed:
     Browse OPC-UA node and print result.
 
 :code:`uaread` / :code:`uawrite`:
-    Read / Write attribute of a node, per default reads value of a node.
+    Read / Write attribute of a node, by default reads value of a node.
 
 :code:`uaserver`:
     Run an example OPC-UA server. By importing xml definition and using uawrite command line, it is even possible to expose real data using this server.

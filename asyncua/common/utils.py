@@ -3,11 +3,13 @@ Helper function and classes that do not rely on asyncua library.
 Helper function and classes depending on ua object are in ua_utils.py
 """
 
-import os
+import asyncio
 import logging
+import os
 import sys
 from dataclasses import Field, fields
-from typing import get_type_hints, Dict, Tuple, Any, Optional
+from typing import Any, Awaitable, Dict, get_type_hints, Optional, Tuple, TypeVar, Union
+
 from ..ua.uaerrors import UaError
 
 _logger = logging.getLogger(__name__)
@@ -15,7 +17,7 @@ _logger = logging.getLogger(__name__)
 
 class ServiceError(UaError):
     def __init__(self, code):
-        super().__init__('UA Service Error')
+        super().__init__("UA Service Error")
         self.code = code
 
 
@@ -41,7 +43,8 @@ class Buffer:
         self._size = size
 
     def __str__(self):
-        return f"Buffer(size:{self._size}, data:{self._data[self._cur_pos:self._cur_pos + self._size]})"
+        return f"Buffer(size:{self._size}, data:{self._data[self._cur_pos : self._cur_pos + self._size]})"
+
     __repr__ = __str__
 
     def __len__(self):
@@ -52,7 +55,7 @@ class Buffer:
 
     def __bytes__(self):
         """Return remains of buffer as bytes."""
-        return bytes(self._data[self._cur_pos:])
+        return bytes(self._data[self._cur_pos :])
 
     def read(self, size):
         """
@@ -63,7 +66,7 @@ class Buffer:
         self._size -= size
         pos = self._cur_pos
         self._cur_pos += size
-        return self._data[pos:self._cur_pos]
+        return self._data[pos : self._cur_pos]
 
     def copy(self, size=-1):
         """
@@ -112,23 +115,36 @@ def fields_with_resolved_types(
 
     fields_ = fields(class_or_instance)
     if sys.version_info.major == 3 and sys.version_info.minor <= 8:
-        resolved_fieldtypes = get_type_hints(
-            class_or_instance,
-            globalns=globalns,
-            localns=localns
-        )
+        resolved_fieldtypes = get_type_hints(class_or_instance, globalns=globalns, localns=localns)
     else:
-        resolved_fieldtypes = get_type_hints(
-            class_or_instance,
-            globalns=globalns,
-            localns=localns,
-            include_extras=include_extras
+        resolved_fieldtypes = get_type_hints(  # type: ignore[call-arg]
+            class_or_instance, globalns=globalns, localns=localns, include_extras=include_extras
         )
     for field in fields_:
         try:
             field.type = resolved_fieldtypes[field.name]
         except KeyError:
-            _logger.info(f"could not resolve fieldtype for field={field} of class_or_instance={class_or_instance}")
+            _logger.info("could not resolve fieldtype for field=%s of class_or_instance=%s", field, class_or_instance)
             pass
 
     return fields_
+
+
+_T = TypeVar("_T")
+
+
+async def wait_for(aw: Awaitable[_T], timeout: Union[int, float, None]) -> _T:
+    """
+    Wrapped version of asyncio.wait_for that does not swallow cancellations
+
+    There is a bug in asyncio.wait_for before Python version 3.12 that prevents the inner awaitable from being cancelled
+    when the task is cancelled from the outside.
+
+    See https://github.com/python/cpython/issues/87555 and https://github.com/python/cpython/issues/86296
+    """
+    if sys.version_info >= (3, 12):
+        return await asyncio.wait_for(aw, timeout)
+
+    import wait_for2
+
+    return await wait_for2.wait_for(aw, timeout)
